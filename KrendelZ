@@ -608,10 +608,17 @@ local function SendDiscordWebhook(title, description, color)
         return false, "This executor does not support HTTP requests"
     end
 
+    local account = tostring(LocalPlayer.Name or "?")
+    local display = tostring(LocalPlayer.DisplayName or "")
+    if display ~= "" and display ~= account then
+        account = display .. " (@" .. account .. ")"
+    end
+
     local payload = {
         username = "Skibidi Defense Hub",
         embeds = {{
             title = tostring(title or "Skibidi Defense Hub"),
+            author = { name = "Sent by " .. account },
             description = tostring(description or ""),
             color = tonumber(color) or 5793266,
             footer = { text = "Made By KrendelZ :3" },
@@ -652,11 +659,18 @@ local function SendMatchEndWebhook()
 
     local stageName = tostring(State.LobbyChapter) .. " (" .. tostring(State.LobbyMode) .. ")"
 
+    local account = tostring(LocalPlayer.Name or "?")
+    local display = tostring(LocalPlayer.DisplayName or "")
+    if display ~= "" and display ~= account then
+        account = display .. " (@" .. account .. ")"
+    end
+
     local payload = {
         ["username"] = "Skibidi Defense Hub",
         ["embeds"] = {
             {
                 ["title"] = "Skibidi Defense Match Report",
+                ["author"] = { ["name"] = "Sent by " .. account },
                 ["description"] = string.format("**Stage:** %s\n**Result:** %s", stageName, resultText),
                 ["color"] = embedColor,
                 ["image"] = { ["url"] = mainImage },
