@@ -6433,39 +6433,84 @@ do
         Items.Running = false
     end
 
-    -- Door reward toasts have no fixed wording, so the category comes from a
-    -- keyword and the amount from the first number in the text.
+    -- The number that belongs to a keyword is the closest one before it, so
+    -- "Wave 3! +50 Crystals" yields 50 and not 3.
+    local function NumberNear(text, keyword)
+        local start = text:find(keyword, 1, true)
+        if not start then
+            return nil
+        end
+        local before = text:sub(1, start - 1)
+        local last = nil
+        for digits in before:gmatch("(%d[%d,]*)") do
+            last = digits
+        end
+        if last then
+            local cleaned = last:gsub(",", "")
+            local value = tonumber(cleaned)
+            if value then
+                return value
+            end
+        end
+        local digits = text:sub(start):match("(%d[%d,]*)")
+        if digits then
+            local cleaned = digits:gsub(",", "")
+            return tonumber(cleaned)
+        end
+        return nil
+    end
+
+    -- Door reward toasts have no fixed wording: any message that mentions the
+    -- keyword counts, and every reward named in it is added.
     function Items.ParseReward(text)
         local lower = string.lower(tostring(text or ""))
         if lower == "" then
             return nil
         end
-        local kind = nil
-        -- "Premium Upgrade Coupon" is the in-game name for the premium coupon.
-        if lower:find("coupon", 1, true) and (lower:find("premium", 1, true) or lower:find("vip", 1, true)) then
-            kind = "VipCoupons"
-        elseif lower:find("coupon", 1, true) then
-            kind = "Coupons"
-        elseif lower:find("cursed", 1, true) or lower:find("%f[%a]keys?%f[%A]") then
-            kind = "CursedKeys"
-        -- The game calls the shards "Crystals".
-        elseif lower:find("crystal", 1, true) or lower:find("shard", 1, true) then
-            kind = "Shards"
-        -- The game calls the pumpkins "Jacks".
-        elseif lower:find("%f[%a]jacks?%f[%A]") or lower:find("pumpkin", 1, true) then
-            kind = "Pumpkins"
+
+        local hits = {}
+        if lower:find("coupon", 1, true) then
+            -- "Premium Upgrade Coupon" is the in-game premium coupon.
+            if lower:find("premium", 1, true) or lower:find("vip", 1, true) then
+                hits[#hits + 1] = { "VipCoupons", "coupon" }
+            else
+                hits[#hits + 1] = { "Coupons", "coupon" }
+            end
         end
-        if not kind then
+        if lower:find("cursed", 1, true) then
+            hits[#hits + 1] = { "CursedKeys", "cursed" }
+        elseif lower:find("%f[%a]keys?%f[%A]") then
+            hits[#hits + 1] = { "CursedKeys", "key" }
+        end
+        -- The game calls the shards "Crystals".
+        if lower:find("crystal", 1, true) then
+            hits[#hits + 1] = { "Shards", "crystal" }
+        elseif lower:find("shard", 1, true) then
+            hits[#hits + 1] = { "Shards", "shard" }
+        end
+        -- The game calls the pumpkins "Jacks".
+        if lower:find("%f[%a]jacks?%f[%A]") then
+            hits[#hits + 1] = { "Pumpkins", "jack" }
+        elseif lower:find("pumpkin", 1, true) then
+            hits[#hits + 1] = { "Pumpkins", "pumpkin" }
+        end
+
+        if #hits == 0 then
             return nil
         end
-        local digits = lower:match("(%d[%d,]*)") or ""
-        local cleaned = digits:gsub(",", "")
-        local amount = tonumber(cleaned) or 1
-        if amount <= 0 then
-            amount = 1
+
+        local firstKind, firstAmount = nil, nil
+        for _, hit in ipairs(hits) do
+            local amount = NumberNear(lower, hit[2]) or 1
+            if amount <= 0 then
+                amount = 1
+            end
+            Items.Rewards[hit[1]] = (Items.Rewards[hit[1]] or 0) + amount
+            if not firstKind then
+                firstKind, firstAmount = hit[1], amount
+            end
         end
-        Items.Rewards[kind] = (Items.Rewards[kind] or 0) + amount
-        return kind, amount
+        return firstKind, firstAmount
     end
 
     function Items.SendRewardReport()
