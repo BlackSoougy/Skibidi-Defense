@@ -43,6 +43,7 @@ local State = {
     WebhookEnabled = false,
     WebhookURL = "",
     WebhookMatchEnd = true,
+    DoorRewards = true,
     Speed = 1,
     PlaybackMode = "Hybrid",
     ProfileName = "",
@@ -5810,6 +5811,8 @@ local Farm = {
     AllDoorsCoolingAt = 0,
     DoorCooldownHit = false,
     DoorCooldownHitAt = 0,
+    DoorGen = 0,
+    CrystalGen = 0,
     CrystalRunning = false,
     CrystalVisited = {},
     CrystalNextAt = 0,
@@ -6079,8 +6082,8 @@ local function FarmNext(list, cursorField, visited, cooldown)
     return nil, cursor, total, soonest or 0
 end
 
-local function DoorLoop()
-    while Farm.DoorRunning do
+local function DoorLoop(gen)
+    while Farm.DoorRunning and Farm.DoorGen == gen do
         task.wait(0.25)
         local now = tick()
         if now >= Farm.DoorNextAt then
@@ -6111,7 +6114,7 @@ local function DoorLoop()
                         -- Wait for the server answer. The cooldown toast means this door
                         -- is dead, so hop to the next one instead of idling on it.
                         local waited = 0
-                        while waited < 1.5 and not Farm.DoorCooldownHit do
+                        while waited < 1.5 and not Farm.DoorCooldownHit and Farm.DoorRunning do
                             task.wait(0.1)
                             waited = waited + 0.1
                         end
@@ -6122,6 +6125,9 @@ local function DoorLoop()
                         else
                             if Hub.Items and Hub.Items.NoteDoorOpened then
                                 Hub.Items.NoteDoorOpened()
+                            end
+                            if Hub.Items and Hub.Items.NoteDoorOpenedReward then
+                                Hub.Items.NoteDoorOpenedReward()
                             end
                             Farm.DoorNextAt = tick() + State.DoorInterval
                         end
@@ -6137,8 +6143,8 @@ local function DoorLoop()
     end
 end
 
-local function CrystalLoop()
-    while Farm.CrystalRunning do
+local function CrystalLoop(gen)
+    while Farm.CrystalRunning and Farm.CrystalGen == gen do
         task.wait(0.25)
         local now = tick()
         if now >= Farm.CrystalNextAt then
@@ -6178,14 +6184,21 @@ function Farm.StartDoor()
         return
     end
     Farm.DoorRunning = true
+    Farm.DoorGen = (Farm.DoorGen or 0) + 1
     Farm.DoorNextAt = 0
     Farm.DoorCursor = 1
     FarmReportFor("door", "door farm running")
-    task.spawn(DoorLoop)
+    local gen = Farm.DoorGen
+    task.spawn(function()
+        DoorLoop(gen)
+    end)
 end
 
 function Farm.StopDoor()
     Farm.DoorRunning = false
+    -- Bumping the generation kills every loop that is still inside a task.wait,
+    -- including duplicates left behind by an earlier injection.
+    Farm.DoorGen = (Farm.DoorGen or 0) + 1
     FarmReportFor("door", "door farm stopped")
 end
 
@@ -6194,14 +6207,19 @@ function Farm.StartCrystal()
         return
     end
     Farm.CrystalRunning = true
+    Farm.CrystalGen = (Farm.CrystalGen or 0) + 1
     Farm.CrystalNextAt = 0
     Farm.CrystalCursor = 1
     FarmReportFor("crystal", "crystal farm running")
-    task.spawn(CrystalLoop)
+    local gen = Farm.CrystalGen
+    task.spawn(function()
+        CrystalLoop(gen)
+    end)
 end
 
 function Farm.StopCrystal()
     Farm.CrystalRunning = false
+    Farm.CrystalGen = (Farm.CrystalGen or 0) + 1
     FarmReportFor("crystal", "crystal farm stopped")
 end
 
@@ -6250,6 +6268,16 @@ do
         PumpkinStatus = "idle",
         BasketStatus = "idle",
         Listener = nil,
+        Running = true,
+        ReportToken = 0,
+        Rewards = {
+            Doors = 0,
+            Shards = 0,
+            Coupons = 0,
+            VipCoupons = 0,
+            CursedKeys = 0,
+            Pumpkins = 0,
+        },
     }
 
     Items.PumpkinItem = "Pumpkinspice"
@@ -6387,16 +6415,90 @@ do
         return Items.ToastSeen == true
     end
 
+    function Items.Stop()
+        Items.Running = false
+    end
+
+    -- Door reward toasts have no fixed wording, so the category comes from a
+    -- keyword and the amount from the first number in the text.
+    function Items.ParseReward(text)
+        local lower = string.lower(tostring(text or ""))
+        if lower == "" then
+            return nil
+        end
+        local kind = nil
+        if lower:find("vip", 1, true) and lower:find("coupon", 1, true) then
+            kind = "VipCoupons"
+        elseif lower:find("coupon", 1, true) then
+            kind = "Coupons"
+        elseif lower:find("cursed", 1, true) or lower:find("%f[%a]keys?%f[%A]") then
+            kind = "CursedKeys"
+        elseif lower:find("shard", 1, true) then
+            kind = "Shards"
+        elseif lower:find("pumpkin", 1, true) then
+            kind = "Pumpkins"
+        end
+        if not kind then
+            return nil
+        end
+        local amount = tonumber(lower:match("(%d+)")) or 1
+        if amount <= 0 then
+            amount = 1
+        end
+        Items.Rewards[kind] = (Items.Rewards[kind] or 0) + amount
+        return kind, amount
+    end
+
+    function Items.SendRewardReport()
+        if not State.DoorRewards then
+            return false
+        end
+        local r = Items.Rewards
+        local lines = {
+            "**Doors opened:** " .. tostring(r.Doors or 0),
+            "**Shards:** " .. tostring(r.Shards or 0),
+            "**Coupons:** " .. tostring(r.Coupons or 0),
+            "**VIP Coupons:** " .. tostring(r.VipCoupons or 0),
+            "**Cursed Keys:** " .. tostring(r.CursedKeys or 0),
+            "**Pumpkins:** " .. tostring(r.Pumpkins or 0),
+        }
+        return SendDiscordWebhook("Door Opened - Farm Totals", table.concat(lines, "\n"), 16753920)
+    end
+
+    function Items.NoteDoorOpenedReward()
+        Items.Rewards.Doors = (Items.Rewards.Doors or 0) + 1
+        local token = (Items.ReportToken or 0) + 1
+        Items.ReportToken = token
+        task.delay(1.5, function()
+            if Items.ReportToken ~= token then
+                return
+            end
+            pcall(Items.SendRewardReport)
+        end)
+    end
+
     local function OnToast(data)
-        if not IsCooldownToast(data) then
+        if type(data) ~= "table" then
             return
         end
-        Items.ToastSeen = true
-        Items.ToastCount = Items.ToastCount + 1
-        Items.LastToastAt = tick()
-        Farm.DoorCooldownHit = true
-        Farm.DoorCooldownHitAt = tick()
-        Items.LastToastText = tostring(data.ContentText or data.Content or "")
+        local content = tostring(data.ContentText or data.Content or "")
+        if IsCooldownToast(data) then
+            Items.LastToastText = content
+            -- Only react while the door farm is actually running.
+            if not Farm.DoorRunning then
+                return
+            end
+            Items.ToastSeen = true
+            Items.ToastCount = Items.ToastCount + 1
+            Items.LastToastAt = tick()
+            Farm.DoorCooldownHit = true
+            Farm.DoorCooldownHitAt = tick()
+            return
+        end
+        if not State.DoorRewards then
+            return
+        end
+        Items.ParseReward(tostring(data.Title or "") .. " " .. content)
     end
 
     local function AttachToast()
@@ -6430,7 +6532,7 @@ do
     local function Loop()
         local nextAttach = 0
         local nextPaint = 0
-        while true do
+        while Items.Running do
             task.wait(0.5)
             local now = tick()
 
@@ -7443,6 +7545,7 @@ State.FpsCapLast = math.max(5, math.floor(tonumber(Config.FpsCapLast) or (State.
 State.WebhookEnabled = Config.WebhookEnabled == true
 State.WebhookURL = tostring(Config.WebhookURL or "")
 State.WebhookMatchEnd = Config.WebhookMatchEnd ~= false
+State.DoorRewards = Config.DoorRewards ~= false
 State.PlaybackEnabled = Config.PlaybackEnabled == true
 State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 6)
 State.PlaybackMode = table.find({ "Hybrid", "Time", "Money" }, Config.PlaybackMode) and Config.PlaybackMode or "Hybrid"
@@ -7470,6 +7573,7 @@ local function SaveConfig()
         WebhookEnabled = State.WebhookEnabled,
         WebhookURL = State.WebhookURL,
         WebhookMatchEnd = State.WebhookMatchEnd,
+        DoorRewards = State.DoorRewards,
         PlaybackEnabled = State.PlaybackEnabled,
         Speed = State.Speed,
         PlaybackMode = State.PlaybackMode,
@@ -8151,6 +8255,19 @@ HookBox:AddActionRow("Send Test Webhook", "Posts a test embed to the configured 
         Notify("Webhook failed", tostring(message))
     end
 end)
+HookBox:AddToggle("Door Rewards", "Posts the door totals every time a door opens", State.DoorRewards, function(value)
+    State.DoorRewards = value == true
+    QueueSave()
+end)
+Gui.DoorStatsRow = MakeInfoRow(HookBox, "Doors opened: 0", "no doors yet", StarHubUI.Icons.Teleport)
+HookBox:AddActionRow("Reset Door Stats", "Clears every door counter", StarHubUI.Icons.Skull, function()
+    if Hub.Items and Hub.Items.Rewards then
+        for key in pairs(Hub.Items.Rewards) do
+            Hub.Items.Rewards[key] = 0
+        end
+    end
+    Notify("Door Stats", "Counters reset")
+end)
 
 -- System ----------------------------------------------------------------------
 
@@ -8285,6 +8402,12 @@ local function PaintItemStatus()
         Gui.PumpkinStatus:SetTitle("Pumpkinspice: " .. tostring(Hub.Items.PumpkinStatus))
         Gui.PumpkinStatus:SetDesc(string.format("cooldown toasts: %d | all doors: %s",
             Hub.Items.ToastCount, Hub.Items.AllDoorsCooling() and "yes" or "no"))
+    end
+    if Gui.DoorStatsRow and Hub.Items.Rewards then
+        local r = Hub.Items.Rewards
+        Gui.DoorStatsRow:SetTitle(string.format("Doors opened: %d", r.Doors or 0))
+        Gui.DoorStatsRow:SetDesc(string.format("shards %d | coupons %d | vip %d | cursed %d | pumpkins %d",
+            r.Shards or 0, r.Coupons or 0, r.VipCoupons or 0, r.CursedKeys or 0, r.Pumpkins or 0))
     end
     if Gui.BasketStatus then
         Gui.BasketStatus:SetTitle("2x Drop: " .. tostring(Hub.Items.BasketStatus))
@@ -8900,6 +9023,11 @@ end)
 function Hub.Destroy()
     MovingSession = MovingSession + 1
     StopCharacterMovement()
+    pcall(Farm.StopDoor)
+    pcall(Farm.StopCrystal)
+    if Hub.Items and type(Hub.Items.Stop) == "function" then
+        pcall(Hub.Items.Stop)
+    end
     State.Running = false
     State.Recording = false
     State.Playing = false
