@@ -59,8 +59,16 @@ local State = {
     PendingAbilityClickAt = -math.huge,
     PendingAbilityIndex = 1,
     DoorFarm = false,
+    DoorOffsetX = 0,
+    DoorOffsetY = 2,
+    DoorOffsetZ = 0,
+    DoorPose = "Stand",
+    DoorFaceAway = false,
     DoorInterval = 10,
     DoorCooldown = 1800,
+    ClearMapAuto = true,
+    PromptWalls = true,
+    PromptAnywhere = true,
     CrystalFarm = false,
     CrystalInterval = 5,
     CrystalCooldown = 60,
@@ -79,6 +87,8 @@ local State = {
     FullbrightExposure = 0,
     FullbrightNoAtmosphere = true,
     FullbrightNoPost = true,
+    FovEnabled = false,
+    FovValue = 70,
     FpsCap = 240,
     FpsCapLast = 240,
     Pumpkinspice = false,
@@ -5825,6 +5835,7 @@ local Farm = {
     AllDoorsCoolingAt = 0,
     DoorCooldownHit = false,
     DoorCooldownHitAt = 0,
+    LastToastAt = 0,
     DoorGen = 0,
     CrystalGen = 0,
     CrystalRunning = false,
@@ -5879,29 +5890,326 @@ local function FarmTeleport(part, height)
     return true
 end
 
-local function FarmInteract(target)
-    for _, obj in ipairs(target:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") then
-            pcall(function()
-                fireproximityprompt(obj)
-            end)
-            return true
+-- Doors: land UNDER the door part, at its lower edge, instead of on top of it.
+-- On top the character stands on the door, the prompt sits behind the surface
+-- and the hit usually bounces off. At the bottom edge the root is in the
+-- doorway itself, which is where the prompt actually accepts a hit.
+-- The offset is world-space: door parts are often rotated, so a local Y offset
+-- would push the character sideways.
+-- Never go below the bottom edge - with noclip on the character would simply
+-- fall through the floor and into the void.
+--
+-- Everything is tunable from the UI now:
+--   State.DoorOffsetX / Y / Z - studs added on top of the anchor point,
+--                               Y counts up from the door's bottom edge
+--   State.DoorPose            - stand / lie on back / front / left / right
+--   State.DoorFaceAway        - flip 180 degrees, which side faces the door
+--
+-- Poses are rotations applied in the character's own frame after it has been
+-- turned towards the door: pitch tips the body backwards/forwards (X axis),
+-- roll tips it sideways (Z axis). Table lives on Farm, not in a local - the
+-- main chunk is already at 192 of the 200 allowed locals.
+Farm.Poses = {
+    ["Stand"] = { pitch = 0, roll = 0 },
+    ["Lie on back"] = { pitch = -math.pi / 2, roll = 0 },
+    ["Lie on front"] = { pitch = math.pi / 2, roll = 0 },
+    ["Lie on left side"] = { pitch = 0, roll = math.pi / 2 },
+    ["Lie on right side"] = { pitch = 0, roll = -math.pi / 2 },
+    ["Head down"] = { pitch = math.pi, roll = 0 },
+}
+
+function Farm.TeleportUnder(part, gap)
+    local root = FarmRoot()
+    if not root or not part then
+        return false
+    end
+
+    local lift = tonumber(gap) or tonumber(State.DoorOffsetY) or 2
+    local offsetX = tonumber(State.DoorOffsetX) or 0
+    local offsetZ = tonumber(State.DoorOffsetZ) or 0
+
+    local half = 0
+    pcall(function()
+        half = part.Size.Y * 0.5
+    end)
+    if not half or half ~= half or half <= 0 then
+        half = 3
+    end
+
+    local position = Vector3.new(
+        part.Position.X + offsetX,
+        part.Position.Y - half + lift,
+        part.Position.Z + offsetZ
+    )
+
+    -- Horizontal direction the door faces. Flattened, because a door part can be
+    -- tilted and we never want the character nose-down into the floor.
+    local direction = nil
+    pcall(function()
+        local look = part.CFrame.LookVector
+        direction = Vector3.new(look.X, 0, look.Z)
+        if direction.Magnitude < 0.01 then
+            direction = Vector3.new(0, 0, -1)
+        end
+        direction = direction.Unit
+    end)
+    if not direction then
+        direction = Vector3.new(0, 0, -1)
+    end
+    if State.DoorFaceAway then
+        direction = -direction
+    end
+
+    local pose = Farm.Poses[State.DoorPose] or Farm.Poses["Stand"]
+    root.CFrame = CFrame.lookAt(position, position + direction)
+        * CFrame.Angles(pose.pitch, 0, pose.roll)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    return true
+end
+
+--==========================================================================
+-- Noclip for the door farm
+-- Switched on the moment the farm starts, restored the moment it stops.
+--
+-- Noclip alone is not enough here: with CanCollide = false nothing holds the
+-- character up any more, so right after the teleport it starts falling through
+-- the map and ends up in the void. The root is therefore anchored for the whole
+-- farm - the teleports keep working (CFrame is written directly) and the
+-- character simply hovers where it was put instead of sinking.
+--==========================================================================
+
+Farm.NoclipActive = false
+Farm.NoclipOriginal = {}
+Farm.NoclipParts = {}
+Farm.NoclipCharacter = nil
+Farm.NoclipRoot = nil
+Farm.NoclipConnection = nil
+Farm.NoclipAdded = nil
+
+-- RunService выше объявлен ВНУТРИ модуля StarHubUI и снаружи не виден, поэтому
+-- сервис берётся прямо здесь. Всё ниже живёт полями Farm: у чанка хаба уже 192
+-- локальные переменные, а лимит Lua/Luau - 200 на функцию. Ещё пять local и
+-- скрипт перестаёт компилироваться целиком ("too many local variables").
+function Farm.NoclipCollect(character)
+    local list = {}
+    for _, item in ipairs(character:GetDescendants()) do
+        if item:IsA("BasePart") then
+            list[#list + 1] = item
+            if Farm.NoclipOriginal[item] == nil then
+                Farm.NoclipOriginal[item] = item.CanCollide
+            end
+            item.CanCollide = false
         end
     end
-    for _, obj in ipairs(target:GetDescendants()) do
-        if obj:IsA("ClickDetector") then
-            pcall(function()
-                fireclickdetector(obj)
-            end)
-            return true
+    Farm.NoclipParts = list
+    -- Hold the character exactly where the teleport put it.
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root then
+        Farm.NoclipRoot = root
+        pcall(function()
+            root.Anchored = true
+        end)
+    end
+end
+
+function Farm.NoclipBind(character)
+    if Farm.NoclipAdded then
+        pcall(function()
+            Farm.NoclipAdded:Disconnect()
+        end)
+        Farm.NoclipAdded = nil
+    end
+    Farm.NoclipCharacter = character
+    Farm.NoclipCollect(character)
+    Farm.NoclipAdded = character.DescendantAdded:Connect(function(item)
+        if not Farm.NoclipActive then
+            return
         end
+        if not item:IsA("BasePart") then
+            return
+        end
+        if Farm.NoclipOriginal[item] == nil then
+            Farm.NoclipOriginal[item] = item.CanCollide
+        end
+        item.CanCollide = false
+        table.insert(Farm.NoclipParts, item)
+    end)
+end
+
+function Farm.NoclipEnforce()
+    if not Farm.NoclipActive then
+        return
+    end
+    local character = LocalPlayer.Character
+    if not character then
+        return
+    end
+    if Farm.NoclipCharacter ~= character then
+        Farm.NoclipBind(character)
+        return
+    end
+    for _, part in ipairs(Farm.NoclipParts) do
+        if part.Parent and part.CanCollide then
+            if Farm.NoclipOriginal[part] == nil then
+                Farm.NoclipOriginal[part] = true
+            end
+            part.CanCollide = false
+        end
+    end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root then
+        Farm.NoclipRoot = root
+        if not root.Anchored then
+            pcall(function()
+                root.Anchored = true
+            end)
+        end
+    end
+end
+
+function Farm.SetNoclip(on)
+    if on then
+        if Farm.NoclipActive then
+            return
+        end
+        Farm.NoclipActive = true
+        local character = LocalPlayer.Character
+        if character then
+            Farm.NoclipBind(character)
+        end
+        if not Farm.NoclipConnection then
+            Farm.NoclipConnection = game:GetService("RunService").Heartbeat:Connect(Farm.NoclipEnforce)
+        end
+    else
+        Farm.NoclipActive = false
+        if Farm.NoclipConnection then
+            pcall(function()
+                Farm.NoclipConnection:Disconnect()
+            end)
+            Farm.NoclipConnection = nil
+        end
+        if Farm.NoclipAdded then
+            pcall(function()
+                Farm.NoclipAdded:Disconnect()
+            end)
+            Farm.NoclipAdded = nil
+        end
+        for part, value in pairs(Farm.NoclipOriginal) do
+            if part.Parent then
+                pcall(function()
+                    part.CanCollide = value
+                end)
+            end
+        end
+        -- Release the hold, otherwise the character stays frozen after stopping.
+        local roots = {}
+        if Farm.NoclipRoot then
+            roots[#roots + 1] = Farm.NoclipRoot
+        end
+        local character = LocalPlayer.Character
+        local liveRoot = character and character:FindFirstChild("HumanoidRootPart")
+        if liveRoot and liveRoot ~= Farm.NoclipRoot then
+            roots[#roots + 1] = liveRoot
+        end
+        for _, root in ipairs(roots) do
+            if root and root.Parent then
+                pcall(function()
+                    root.Anchored = false
+                end)
+            end
+        end
+        Farm.NoclipRoot = nil
+        Farm.NoclipOriginal = {}
+        Farm.NoclipParts = {}
+        Farm.NoclipCharacter = nil
+    end
+end
+
+--==========================================================================
+-- Промпты: дистанция обычная, но стены и игроки больше не перекрывают
+-- взаимодействие. MaxActivationDistance не трогаем - достаём ровно настолько,
+-- насколько разрешил разработчик. Трогаем только RequiresLineOfSight и сразу
+-- возвращаем его назад, чтобы в мире ничего не осталось изменённым.
+--==========================================================================
+
+function Farm.PromptReach(prompt)
+    local reach = tonumber(prompt.MaxActivationDistance)
+    if not reach or reach <= 0 then
+        return 10
+    end
+    return reach
+end
+
+function Farm.TriggerPrompt(prompt)
+    local previous = prompt.RequiresLineOfSight
+    pcall(function()
+        prompt.RequiresLineOfSight = false
+    end)
+    local held = pcall(function()
+        prompt:InputHoldBegin()
+    end)
+    if held then
+        local hold = prompt.HoldDuration
+        if type(hold) ~= "number" or hold <= 0 then
+            hold = 0.15
+        end
+        task.wait(hold + 0.05)
+        pcall(function()
+            prompt:InputHoldEnd()
+        end)
+        task.wait(0.05)
+    elseif type(fireproximityprompt) == "function" then
+        -- InputHoldBegin в этом исполнителе не сработал. Идём через хелпер, но
+        -- только потому, что дистанцию до промпта мы уже проверили сами.
+        held = pcall(fireproximityprompt, prompt)
     end
     pcall(function()
-        local virtualInput = game:GetService("VirtualInputManager")
-        virtualInput:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-        task.wait(0.1)
-        virtualInput:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+        prompt.RequiresLineOfSight = previous
     end)
+    return held
+end
+
+local function FarmInteract(target)
+    local root = FarmRoot()
+    local origin = root and root.Position or nil
+
+    local prompts = {}
+    local detectors = {}
+    for _, obj in ipairs(target:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") then
+            prompts[#prompts + 1] = obj
+        elseif obj:IsA("ClickDetector") then
+            detectors[#detectors + 1] = obj
+        end
+    end
+
+    for _, prompt in ipairs(prompts) do
+        if prompt.Enabled and Farm.TriggerPrompt(prompt) then
+            return true
+        end
+    end
+
+    for _, detector in ipairs(detectors) do
+        -- Клик разрешён, только если реально стоим в радиусе детектора.
+        local part = detector.Parent
+        local guard = 0
+        while part and not part:IsA("BasePart") and guard < 8 do
+            guard = guard + 1
+            part = part.Parent
+        end
+        local reach = tonumber(detector.MaxActivationDistance) or 32
+        local inRange = true
+        if origin and part and part:IsA("BasePart") then
+            inRange = (part.Position - origin).Magnitude <= reach
+        end
+        if inRange and type(fireclickdetector) == "function" then
+            if pcall(fireclickdetector, detector) then
+                return true
+            end
+        end
+    end
+
     return false
 end
 
@@ -6096,20 +6404,212 @@ local function FarmNext(list, cursorField, visited, cooldown)
     return nil, cursor, total, soonest or 0
 end
 
+--==========================================================================
+-- Точки вместо дверей
+-- Телепорт идёт по заранее снятым координатам, а не по модели двери. Так фарм
+-- не зависит от того, как называется дверь и где висит её парт: точка - это
+-- место, где игрок реально стоял.
+--==========================================================================
+
+Farm.PointData = [[
+184, 694, -1464
+13, 694, -1307
+-46, 694, -1474
+-79, 695, -1298
+-173, 695, -1480
+-181, 694, -1279
+-469, 695, -1294
+-378, 694, -1465
+-277, 694, -1472
+-423, 694, -1576
+-416, 694, -1702
+-366, 695, -1957
+-268, 694, -1963
+-193, 694, -2033
+-385, 694, -2158
+-272, 694, -2156
+-172, 694, -2167
+-443, 694, -2320
+-333, 695, -2340
+-87, 694, -2331
+11, 695, -2342
+-41, 695, -2161
+353, 694, -2353
+372, 694, -2157
+214, 694, -2165
+163, 694, -2036
+-44, 694, -2020
+200, 694, -1570
+-51, 694, -1612
+]]
+
+function Farm.CollectPoints()
+    local list = {}
+    local count = 0
+    for line in string.gmatch(Farm.PointData or "", "[^\r\n]+") do
+        local x, y, z = string.match(line, "^(%-?%d+)%s*,%s*(%-?%d+)%s*,%s*(%-?%d+)$")
+        if x then
+            count = count + 1
+            list[#list + 1] = {
+                Name = "point" .. tostring(count),
+                Position = Vector3.new(tonumber(x), tonumber(y), tonumber(z)),
+            }
+        end
+    end
+    return list
+end
+
+-- Промпты в мире меняются редко, поэтому список кэшируется: полный обход
+-- Workspace на каждой двери - это лишние сотни миллисекунд.
+Farm.PromptCache = nil
+Farm.PromptCacheAt = 0
+
+function Farm.PromptList()
+    local now = tick()
+    if Farm.PromptCache and (now - (Farm.PromptCacheAt or 0)) < 60 then
+        return Farm.PromptCache
+    end
+    local list = {}
+    pcall(function()
+        for _, item in ipairs(Workspace:GetDescendants()) do
+            if item:IsA("ProximityPrompt") then
+                local part = item.Parent
+                local guard = 0
+                while part and not part:IsA("BasePart") and guard < 8 do
+                    guard = guard + 1
+                    part = part.Parent
+                end
+                if part and part:IsA("BasePart") then
+                    list[#list + 1] = {
+                        Prompt = item,
+                        Part = part,
+                        Position = part.Position,
+                    }
+                end
+            end
+        end
+    end)
+    Farm.PromptCache = list
+    Farm.PromptCacheAt = now
+    return list
+end
+
+function Farm.TeleportToPoint(point)
+    local root = FarmRoot()
+    if not root or not point then
+        return false
+    end
+    local base = point.Position
+    local offsetX = tonumber(State.DoorOffsetX) or 0
+    local offsetY = tonumber(State.DoorOffsetY) or 0
+    local offsetZ = tonumber(State.DoorOffsetZ) or 0
+    local position = Vector3.new(base.X + offsetX, base.Y + offsetY, base.Z + offsetZ)
+
+    -- Направление берём с камеры: куда смотришь - туда и встанешь лицом.
+    local direction = Vector3.new(0, 0, -1)
+    pcall(function()
+        local camera = Workspace.CurrentCamera
+        if camera then
+            local look = camera.CFrame.LookVector
+            local flat = Vector3.new(look.X, 0, look.Z)
+            if flat.Magnitude > 0.01 then
+                direction = flat.Unit
+            end
+        end
+    end)
+    if State.DoorFaceAway then
+        direction = -direction
+    end
+
+    local pose = Farm.Poses[State.DoorPose] or Farm.Poses["Stand"]
+    root.CFrame = CFrame.lookAt(position, position + direction)
+        * CFrame.Angles(pose.pitch, 0, pose.roll)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    return true
+end
+
+-- Держим ближайший промпт так же, как это сделал бы игрок: сначала телепорт
+-- в точку, потом нажатие. Дистанцию не подменяем - она остаётся такой, какой
+-- её написал разработчик. Не мешают только стены и игроки: промпт срабатывает
+-- и когда он за стеной, и когда вообще не попадает в кадр.
+function Farm.InteractNear(point, radius)
+    local limit = tonumber(radius) or math.huge
+    local best = nil
+    local bestDistance = math.huge
+    for _, item in ipairs(Farm.PromptList()) do
+        local prompt = item.Prompt
+        if prompt.Enabled and item.Part.Parent then
+            local distance = (item.Position - point.Position).Magnitude
+            -- Дистанция - своя у каждого промпта. Дальше обычной не достаём,
+            -- но и стены с игроками больше не обрезают. +1.5 студа - это
+            -- компенсация округления координат в списке точек, не дальность.
+            local reach = math.min(Farm.PromptReach(prompt) + 1.5, limit)
+            if distance <= reach and distance < bestDistance then
+                best = prompt
+                bestDistance = distance
+            end
+        end
+    end
+    if not best then
+        return false
+    end
+    return Farm.TriggerPrompt(best)
+end
+
+-- Одна попытка на точке. Возвращает:
+--   "cooldown"    сервер ответил тостом про кулдаун
+--   "opened"      дверь ответила наградой
+--   "silent"      реакции нет
+--   "unreachable" телепорт не удался
+--   "stopped"     фарм выключили посреди попытки
+function Farm.TryPoint(point, timeout)
+    local startedAt = tick()
+    Farm.DoorCooldownHit = false
+    Farm.DoorCooldownHitAt = 0
+
+    if not Farm.TeleportToPoint(point) then
+        return "unreachable"
+    end
+    task.wait(1.0)
+
+    if not Farm.InteractNear(point) then
+        -- Ни одного промпта в обычной дистанции - точку не сжигаем, вернёмся.
+        return "unreachable"
+    end
+
+    local limit = tonumber(timeout) or 1.5
+    local waited = 0
+    while waited < limit do
+        if Farm.DoorCooldownHit then
+            return "cooldown"
+        end
+        if (Farm.LastToastAt or 0) >= startedAt then
+            return "opened"
+        end
+        if not Farm.DoorRunning then
+            return "stopped"
+        end
+        task.wait(0.1)
+        waited = waited + 0.1
+    end
+    return "silent"
+end
+
 local function DoorLoop(gen)
     while Farm.DoorRunning and Farm.DoorGen == gen do
         task.wait(0.25)
         local now = tick()
         if now >= Farm.DoorNextAt then
-            local doors = FarmCollect("door")
-            Farm.DoorCount = #doors
-            if #doors == 0 then
-                FarmReportFor("door", "no doors found")
+            local points = Farm.CollectPoints()
+            Farm.DoorCount = #points
+            if #points == 0 then
+                FarmReportFor("door", "no points")
                 Farm.DoorNextAt = now + 5
             else
-                local chosen, index, total, waitFor = FarmNext(doors, "DoorCursor", Farm.DoorVisited, State.DoorCooldown)
+                local chosen, index, total, waitFor = FarmNext(points, "DoorCursor", Farm.DoorVisited, State.DoorCooldown)
                 if not chosen then
-                    FarmReportFor("door", "all " .. tostring(total) .. " doors on cooldown, next in "
+                    FarmReportFor("door", "all " .. tostring(total) .. " points on cooldown, next in "
                         .. tostring(math.ceil(waitFor or 10)) .. "s")
                     Farm.AllDoorsCooling = true
                     Farm.AllDoorsCoolingAt = now
@@ -6117,26 +6617,24 @@ local function DoorLoop(gen)
                 else
                     Farm.DoorCurrent = chosen
                     Farm.AllDoorsCooling = false
-                    FarmReportFor("door", "door " .. tostring(index) .. "/" .. tostring(total) .. " -> " .. tostring(chosen.Name))
-                    local part = FarmPartOf(chosen)
-                    if part and FarmTeleport(part, 4) then
-                        task.wait(1.2)
-                        FarmReportFor("door", "interacting -> " .. tostring(chosen.Name))
-                        Farm.DoorCooldownHit = false
-                        Farm.DoorCooldownHitAt = 0
-                        FarmInteract(chosen)
-                        -- Wait for the server answer. The cooldown toast means this door
-                        -- is dead, so hop to the next one instead of idling on it.
-                        local waited = 0
-                        while waited < 1.5 and not Farm.DoorCooldownHit and Farm.DoorRunning do
-                            task.wait(0.1)
-                            waited = waited + 0.1
-                        end
-                        Farm.DoorVisited[tostring(chosen.Name)] = tick()
-                        if Farm.DoorCooldownHit then
-                            FarmReportFor("door", "cooldown -> skipping " .. tostring(chosen.Name))
+                    local label = tostring(chosen.Name)
+                    FarmReportFor("door", "point " .. tostring(index) .. "/" .. tostring(total) .. " -> " .. label)
+                    local result = Farm.TryPoint(chosen, 1.5)
+
+                    if result == "stopped" then
+                        Farm.DoorRunning = false
+                    elseif result == "unreachable" then
+                        FarmReportFor("door", "could not reach " .. label)
+                        -- retry this one in 5 seconds instead of skipping it for the whole cooldown
+                        Farm.DoorVisited[label] = tick() - math.max(0, State.DoorCooldown - 5)
+                        Farm.DoorNextAt = tick() + State.DoorInterval
+                    else
+                        Farm.DoorVisited[label] = tick()
+                        if result == "cooldown" then
+                            FarmReportFor("door", "cooldown -> skipping " .. label)
                             Farm.DoorNextAt = 0
-                        else
+                        elseif result == "opened" then
+                            FarmReportFor("door", "opened -> " .. label)
                             if Hub.Items and Hub.Items.NoteDoorOpened then
                                 Hub.Items.NoteDoorOpened()
                             end
@@ -6144,12 +6642,10 @@ local function DoorLoop(gen)
                                 Hub.Items.NoteDoorOpenedReward()
                             end
                             Farm.DoorNextAt = tick() + State.DoorInterval
+                        else
+                            FarmReportFor("door", "no answer -> " .. label)
+                            Farm.DoorNextAt = tick() + State.DoorInterval
                         end
-                    else
-                        FarmReportFor("door", "could not reach " .. tostring(chosen.Name))
-                        -- retry this one in 5 seconds instead of skipping it for the whole cooldown
-                        Farm.DoorVisited[tostring(chosen.Name)] = tick() - math.max(0, State.DoorCooldown - 5)
-                        Farm.DoorNextAt = tick() + State.DoorInterval
                     end
                 end
             end
@@ -6190,6 +6686,947 @@ local function CrystalLoop(gen)
                 end
             end
         end
+    end
+end
+
+--==========================================================================
+-- Разовая чистка карты
+-- Список снят с журнала AltDelete: 168 объектов (дома, их основания, двери
+-- вместе со Stuff/Viewport). Удаление идёт ОДИН раз по кнопке: повторных
+-- проходов по таймеру и ловли респавна здесь нет. Объект не уничтожается,
+-- а отвязывается от родителя, поэтому перезаход в игру возвращает всё назад.
+--
+-- Что и как сопоставляется:
+--   * Обычные имена (root, Viewport, Door, Doorframe, PlaneSurface, Union,
+--     NPCTo) — имя + класс + позиция ±8.
+--   * Закреплённые (Part|Part, 85 штук) — имя + класс + позиция ±4 И размер
+--     ±1. Одного имени тут мало: под «Part» попадёт вообще всё.
+--   * Если по позиции не нашлось ничего (карта уехала), включается запасной
+--     проход по «имя + класс + размер», причём только когда объектов с такой
+--     подписью в мире не больше, чем целей. Иначе лишние не трогаются.
+--==========================================================================
+
+Farm.ClearData = [[
+Part|Part|-43,700,-2136|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-36,699,-2164|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-42,699,-2163|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-48,699,-2164|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-43,693,-2136|78,4,54|Workspace.Model.Folder.Map.House.Part
+root|Part|-42,697,-2164|4,7,1|Workspace.Door22.root
+Viewport|Part|-42,697,-2164|4,7,0|Workspace.Door22.Viewport
+Door|MeshPart|-42,697,-2165|4,6,1|Workspace.Door22.Stuff.Door
+Doorframe|MeshPart|-42,697,-2165|4,7,1|Workspace.Door22.Stuff.Doorframe
+Union|UnionOperation|-165,709,-2134|78,25,56|Workspace.Model.Folder.Map.house.Union
+Part|Part|-171,696,-2169|16,1,27|Workspace.Model.Folder.Map.house.Part
+Part|Part|-271,700,-2134|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-265,698,-2161|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-271,698,-2161|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-271,693,-2134|78,4,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-277,698,-2161|2,10,4|Workspace.Model.Folder.Map.House.Part
+root|Part|-271,697,-2162|4,7,1|Workspace.Door20.root
+Viewport|Part|-271,697,-2162|4,7,0|Workspace.Door20.Viewport
+Door|MeshPart|-271,696,-2162|4,6,1|Workspace.Door20.Stuff.Door
+Doorframe|MeshPart|-271,697,-2162|4,7,1|Workspace.Door20.Stuff.Doorframe
+Part|Part|-387,700,-2134|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-380,698,-2162|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-386,698,-2161|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-393,698,-2162|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-387,693,-2134|78,4,54|Workspace.Model.Folder.Map.House.Part
+NPCTo|Part|-386,696,-2159|2,2,1|Workspace.Door19.NPCTo
+root|Part|-386,696,-2162|4,7,1|Workspace.Door19.root
+Viewport|Part|-386,696,-2162|4,7,0|Workspace.Door19.Viewport
+Door|MeshPart|-386,696,-2163|4,6,1|Workspace.Door19.Stuff.Door
+Doorframe|MeshPart|-386,696,-2163|4,7,1|Workspace.Door19.Stuff.Doorframe
+Part|Part|-443,696,-2317|16,1,27|Workspace.Model.Folder.Map.house.Part
+PlaneSurface|MeshPart|-336,700,-2335|13,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+PlaneSurface|MeshPart|-330,700,-2341|12,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+Part|Part|-336,695,-2341|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Union|UnionOperation|-343,695,-2341|27,21,12|Workspace.Model.Folder.Map.Houses.Union
+Part|Part|-336,704,-2341|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Part|Part|-88,700,-2354|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-94,698,-2326|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-88,698,-2327|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-82,698,-2326|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-88,693,-2354|78,4,54|Workspace.Model.Folder.Map.House.Part
+root|Part|-88,696,-2326|4,7,1|Workspace.Door27.root
+Viewport|Part|-88,696,-2326|4,7,0|Workspace.Door27.Viewport
+Door|MeshPart|-88,696,-2326|4,6,1|Workspace.Door27.Stuff.Door
+Doorframe|MeshPart|-88,696,-2326|4,7,1|Workspace.Door27.Stuff.Doorframe
+PlaneSurface|MeshPart|8,700,-2337|13,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+PlaneSurface|MeshPart|15,700,-2343|12,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+Part|Part|9,704,-2342|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Part|Part|9,695,-2342|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Union|UnionOperation|1,695,-2342|27,21,12|Workspace.Model.Folder.Map.Houses.Union
+Part|Part|363,701,-2375|48,16,99|Workspace.Model.Folder.Map.Hpise.Part
+root|Part|352,694,-2351|4,7,1|Workspace.Door25.root
+Viewport|Part|352,694,-2351|4,7,0|Workspace.Door25.Viewport
+Door|MeshPart|352,694,-2350|4,6,1|Workspace.Door25.Stuff.Door
+Part|Part|363,692,-2375|48,2,99|Workspace.Model.Folder.Map.Hpise.Part
+Doorframe|MeshPart|352,694,-2350|4,7,1|Workspace.Door25.Stuff.Doorframe
+Part|Part|371,700,-2134|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|366,698,-2161|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|372,698,-2161|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|378,698,-2161|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|371,693,-2134|78,4,54|Workspace.Model.Folder.Map.House.Part
+NPCTo|Part|372,696,-2159|2,2,1|Workspace.Door24.NPCTo
+root|Part|372,697,-2162|4,7,1|Workspace.Door24.root
+Viewport|Part|372,697,-2162|4,7,0|Workspace.Door24.Viewport
+Door|MeshPart|372,696,-2162|4,6,1|Workspace.Door24.Stuff.Door
+Doorframe|MeshPart|372,697,-2162|4,7,1|Workspace.Door24.Stuff.Doorframe
+Part|Part|214,696,-2169|16,1,27|Workspace.Model.Folder.Map.house.Part
+Part|Part|174,701,-2055|48,16,99|Workspace.Model.Folder.Map.Hpise.Part
+Part|Part|174,692,-2055|48,2,99|Workspace.Model.Folder.Map.Hpise.Part
+root|Part|164,694,-2031|4,7,1|Workspace.Door30.root
+Viewport|Part|164,694,-2031|4,7,0|Workspace.Door30.Viewport
+Door|MeshPart|164,694,-2030|4,6,1|Workspace.Door30.Stuff.Door
+Doorframe|MeshPart|164,694,-2030|4,7,1|Workspace.Door30.Stuff.Doorframe
+Part|Part|-44,700,-2042|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-44,693,-2042|78,4,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-38,698,-2015|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-44,698,-2016|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-50,698,-2015|2,10,4|Workspace.Model.Folder.Map.House.Part
+root|Part|-44,697,-2014|4,7,1|Workspace.Door31.root
+Viewport|Part|-44,697,-2015|4,7,0|Workspace.Door31.Viewport
+Door|MeshPart|-44,696,-2014|4,6,1|Workspace.Door31.Stuff.Door
+Doorframe|MeshPart|-44,697,-2014|4,7,1|Workspace.Door31.Stuff.Doorframe
+Part|Part|-169,700,-2034|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-169,693,-2034|78,4,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-197,698,-2028|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-196,698,-2034|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-197,698,-2040|2,10,4|Workspace.Model.Folder.Map.House.Part
+root|Part|-197,696,-2034|4,7,1|Workspace.Door18.root
+NPCTo|Part|-194,696,-2034|2,2,1|Workspace.Door18.NPCTo
+Viewport|Part|-197,696,-2034|4,7,0|Workspace.Door18.Viewport
+Door|MeshPart|-198,696,-2034|4,6,1|Workspace.Door18.Stuff.Door
+Doorframe|MeshPart|-198,696,-2034|4,7,1|Workspace.Door18.Stuff.Doorframe
+Part|Part|-268,696,-1967|16,1,27|Workspace.Model.Folder.Map.house.Part
+PlaneSurface|MeshPart|-363,700,-1961|13,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+PlaneSurface|MeshPart|-369,700,-1955|12,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+Part|Part|-363,695,-1956|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Union|UnionOperation|-356,695,-1956|27,21,12|Workspace.Model.Folder.Map.Houses.Union
+Part|Part|-363,704,-1956|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Part|Part|-421,698,-1708|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-421,698,-1695|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-420,698,-1701|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-393,700,-1701|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-393,693,-1701|78,4,54|Workspace.Model.Folder.Map.House.Part
+NPCTo|Part|-418,696,-1701|2,2,1|Workspace.Door15.NPCTo
+root|Part|-421,697,-1701|4,7,1|Workspace.Door15.root
+Viewport|Part|-421,697,-1701|4,7,0|Workspace.Door15.Viewport
+Doorframe|MeshPart|-421,697,-1701|4,7,1|Workspace.Door15.Stuff.Doorframe
+Door|MeshPart|-421,696,-1701|4,6,1|Workspace.Door15.Stuff.Door
+Part|Part|-427,696,-1576|16,1,27|Workspace.Model.Folder.Map.house.Part
+Part|Part|-378,696,-1460|16,1,27|Workspace.Model.Folder.Map.house.Part
+Part|Part|-276,700,-1496|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-276,693,-1496|78,4,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-282,698,-1468|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-276,698,-1469|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-270,698,-1468|2,10,4|Workspace.Model.Folder.Map.House.Part
+root|Part|-276,696,-1468|4,7,1|Workspace.Door9.root
+Viewport|Part|-276,696,-1468|4,7,0|Workspace.Door9.Viewport
+Door|MeshPart|-276,696,-1467|4,6,1|Workspace.Door9.Stuff.Door
+Doorframe|MeshPart|-276,696,-1467|4,7,1|Workspace.Door9.Stuff.Doorframe
+PlaneSurface|MeshPart|-176,700,-1475|13,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+PlaneSurface|MeshPart|-170,700,-1481|12,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+Part|Part|-175,695,-1480|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Union|UnionOperation|-183,695,-1480|27,21,12|Workspace.Model.Folder.Map.Houses.Union
+Part|Part|-175,704,-1480|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Part|Part|-52,698,-1469|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-45,698,-1469|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-45,700,-1496|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-45,693,-1496|78,4,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-39,698,-1469|2,10,4|Workspace.Model.Folder.Map.House.Part
+root|Part|-46,697,-1468|4,7,1|Workspace.Door11.root
+NPCTo|Part|-46,696,-1471|2,2,1|Workspace.Door11.NPCTo
+Viewport|Part|-46,697,-1468|4,7,0|Workspace.Door11.Viewport
+Door|MeshPart|-46,696,-1468|4,6,1|Workspace.Door11.Stuff.Door
+Doorframe|MeshPart|-46,697,-1468|4,7,1|Workspace.Door11.Stuff.Doorframe
+Part|Part|176,699,-1570|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|203,698,-1576|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|203,698,-1570|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|203,698,-1563|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|176,692,-1570|78,4,54|Workspace.Model.Folder.Map.House.Part
+NPCTo|Part|201,696,-1570|2,2,1|Workspace.Door2.NPCTo
+root|Part|204,696,-1570|4,7,1|Workspace.Door2.root
+Viewport|Part|204,696,-1570|4,7,0|Workspace.Door2.Viewport
+Door|MeshPart|204,696,-1570|4,6,1|Workspace.Door2.Stuff.Door
+Doorframe|MeshPart|204,696,-1570|4,7,1|Workspace.Door2.Stuff.Doorframe
+Part|Part|183,697,-1461|16,1,27|Workspace.Model.Folder.Map.house.Part
+Part|Part|14,696,-1312|16,1,27|Workspace.Model.Folder.Map.house.Part
+Part|Part|-73,699,-1303|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-79,699,-1302|14,10,2|Workspace.Model.Folder.Map.House.Part
+Part|Part|-79,700,-1275|78,10,54|Workspace.Model.Folder.Map.House.Part
+Part|Part|-85,699,-1303|2,10,4|Workspace.Model.Folder.Map.House.Part
+Part|Part|-79,693,-1275|78,4,54|Workspace.Model.Folder.Map.House.Part
+NPCTo|Part|-79,697,-1300|2,2,1|Workspace.Door5.NPCTo
+root|Part|-79,697,-1303|4,7,1|Workspace.Door5.root
+Viewport|Part|-79,697,-1303|4,7,0|Workspace.Door5.Viewport
+Door|MeshPart|-79,697,-1303|4,6,1|Workspace.Door5.Stuff.Door
+Doorframe|MeshPart|-79,697,-1303|4,7,1|Workspace.Door5.Stuff.Doorframe
+Part|Part|-192,701,-1258|48,16,99|Workspace.Model.Folder.Map.Hpise.Part
+Part|Part|-192,692,-1258|48,2,99|Workspace.Model.Folder.Map.Hpise.Part
+root|Part|-182,695,-1283|4,7,1|Workspace.Door6.root
+Viewport|Part|-182,695,-1283|4,7,0|Workspace.Door6.Viewport
+Door|MeshPart|-182,694,-1283|4,6,1|Workspace.Door6.Stuff.Door
+Doorframe|MeshPart|-182,695,-1283|4,7,1|Workspace.Door6.Stuff.Doorframe
+PlaneSurface|MeshPart|-465,700,-1299|13,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+PlaneSurface|MeshPart|-471,700,-1293|12,0,9|Workspace.Model.Folder.Map.Houses.PlaneSurface
+Union|UnionOperation|-458,695,-1294|27,21,12|Workspace.Model.Folder.Map.Houses.Union
+Part|Part|-465,704,-1294|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Part|Part|-465,695,-1294|13,0,12|Workspace.Model.Folder.Map.Houses.Part
+Part|Part|-458,710,-1281|27,8,38|Workspace.Model.Folder.Map.Houses.Part
+]]
+
+Farm.ClearRunning = false
+Farm.ClearRemoved = 0
+Farm.ClearResolved = 0
+Farm.ClearTotal = 0
+Farm.ClearReport = nil
+Farm.ClearAuto = true
+Farm.ClearTolerance = 8
+Farm.ClearSizeUsed = false
+
+-- Закреплённые пары «имя|класс». Таких объектов в карте слишком много, чтобы
+-- верить одному имени: под «Part» попадёт вообще всё. Для закреплённых цели
+-- требуется ещё и точная позиция (±4 студа) вместе с размером (±1 студа).
+-- Длинный проход по размеру для них включается только в том случае, если по
+-- позиции не нашлось ни одной — то есть когда карта стоит совсем не там.
+Farm.ClearPinned = {
+    ["Part|Part"] = true,
+}
+Farm.ClearStrictTolerance = 4
+Farm.ClearSizeTolerance = 1
+Farm.ClearPinnedSizeUsed = false
+Farm.ClearPinnedResolved = 0
+
+function Farm.ClearParse()
+    local list = {}
+    for line in string.gmatch(Farm.ClearData or "", "[^\r\n]+") do
+        local name, class, px, py, pz, sx, sy, sz =
+            string.match(line, "^([^|]+)|([^|]+)|(%-?%d+),(%-?%d+),(%-?%d+)|(%-?%d+),(%-?%d+),(%-?%d+)|")
+        if name then
+            list[#list + 1] = {
+                name = name,
+                class = class,
+                x = tonumber(px),
+                y = tonumber(py),
+                z = tonumber(pz),
+                sizeX = tonumber(sx),
+                sizeY = tonumber(sy),
+                sizeZ = tonumber(sz),
+                pinned = Farm.ClearPinned[name .. "|" .. class] == true,
+                done = false,
+            }
+        end
+    end
+    return list
+end
+
+-- Подпись цели: имя + класс + размер. По ней ищем объекты, которые уехали на
+-- другое место.
+function Farm.ClearSigOf(target)
+    return string.format("%s|%s|%d|%d|%d", target.name, target.class,
+        math.floor((target.sizeX or 0) + 0.5),
+        math.floor((target.sizeY or 0) + 0.5),
+        math.floor((target.sizeZ or 0) + 0.5))
+end
+
+-- Индексы: сетка по 8 студов для поиска по позиции, набор имён для быстрого
+-- отсева, набор классов и количество целей на каждую подпись.
+function Farm.ClearIndex(list)
+    local cells, names, classes, sizes = {}, {}, {}, {}
+    for _, target in ipairs(list) do
+        local cellKey = string.format("%d|%d|%d",
+            math.floor(target.x / 8), math.floor(target.y / 8), math.floor(target.z / 8))
+        local bucket = cells[cellKey]
+        if not bucket then
+            bucket = {}
+            cells[cellKey] = bucket
+        end
+        bucket[#bucket + 1] = target
+
+        names[target.name .. "|" .. target.class] = true
+        classes[target.class] = true
+        local sig = Farm.ClearSigOf(target)
+        sizes[sig] = (sizes[sig] or 0) + 1
+    end
+    return cells, names, classes, sizes
+end
+
+-- Список «неприкасаемых» корней: персонажи всех игроков и модели с Humanoid.
+function Farm.ClearBlocked()
+    local set = {}
+    local players = game:GetService("Players")
+    local okPlayers, list = pcall(function()
+        return players:GetPlayers()
+    end)
+    if okPlayers and list then
+        for _, player in ipairs(list) do
+            local character = player.Character
+            if character then
+                set[character] = true
+            end
+        end
+    end
+    local me = players.LocalPlayer
+    if me and me.Character then
+        set[me.Character] = true
+    end
+    local ok, children = pcall(function()
+        return Workspace:GetChildren()
+    end)
+    if ok and children then
+        for _, item in ipairs(children) do
+            if item:IsA("Model") then
+                local okHumanoid, humanoid = pcall(function()
+                    return item:FindFirstChildOfClass("Humanoid")
+                end)
+                if okHumanoid and humanoid then
+                    set[item] = true
+                end
+            end
+        end
+    end
+    return set
+end
+
+-- Персонажей, NPC, аксессуары и террейн не трогаем никогда.
+function Farm.ClearForbidden(object, blocked)
+    if object:IsA("Terrain") or object:IsA("Player") then
+        return true
+    end
+    local players = game:GetService("Players")
+    if object:IsDescendantOf(players) then
+        return true
+    end
+    if blocked and blocked[object] then
+        return true
+    end
+    local node = object
+    local guard = 0
+    while node and guard < 64 do
+        if blocked and blocked[node] then
+            return true
+        end
+        local parent = node.Parent
+        if parent == nil then
+            break
+        end
+        if parent == Workspace then
+            if node:IsA("Model") then
+                local okHumanoid, humanoid = pcall(function()
+                    return node:FindFirstChildOfClass("Humanoid")
+                end)
+                if okHumanoid and humanoid then
+                    return true
+                end
+            end
+            break
+        end
+        node = parent
+        guard = guard + 1
+    end
+    return false
+end
+
+function Farm.ClearPosition(object)
+    local ok, value = pcall(function()
+        if object:IsA("BasePart") then
+            return object.Position
+        end
+        return object:GetPivot().Position
+    end)
+    if ok then
+        return value
+    end
+    return nil
+end
+
+function Farm.ClearSizeOf(object)
+    local ok, value = pcall(function()
+        if object:IsA("BasePart") then
+            return object.Size
+        end
+        return object:GetExtentsSize()
+    end)
+    if ok and value and (value.X > 0 or value.Y > 0 or value.Z > 0) then
+        return value
+    end
+    if object:IsA("Model") then
+        local low, high = nil, nil
+        local okDesc, list = pcall(function()
+            return object:GetDescendants()
+        end)
+        if okDesc and list then
+            for _, item in ipairs(list) do
+                if item:IsA("BasePart") then
+                    local okPos, position = pcall(function()
+                        return item.Position
+                    end)
+                    if okPos and position then
+                        local half = item.Size * 0.5
+                        local lo = position - half
+                        local hi = position + half
+                        if low then
+                            low = Vector3.new(math.min(low.X, lo.X), math.min(low.Y, lo.Y), math.min(low.Z, lo.Z))
+                            high = Vector3.new(math.max(high.X, hi.X), math.max(high.Y, hi.Y), math.max(high.Z, hi.Z))
+                        else
+                            low, high = lo, hi
+                        end
+                    end
+                end
+            end
+        end
+        if low and high then
+            return high - low
+        end
+    end
+    return Vector3.new(0, 0, 0)
+end
+
+-- Отвязываем объект. Через pcall: одна залоченная часть не должна ронять
+-- весь проход.
+function Farm.ClearDetach(object, blocked)
+    if Farm.ClearForbidden(object, blocked) then
+        return false
+    end
+    local ok = pcall(function()
+        object.Parent = nil
+    end)
+    return ok and object.Parent == nil
+end
+
+-- Размер совпал с точностью до студа. Нужен только закреплённым целям:
+-- в журнале размер округлён, поэтому допускаем ±1.
+function Farm.ClearSizeClose(target, size)
+    if not size then
+        return false
+    end
+    local tol = Farm.ClearSizeTolerance
+    if math.abs((target.sizeX or 0) - size.X) > tol then
+        return false
+    end
+    if math.abs((target.sizeY or 0) - size.Y) > tol then
+        return false
+    end
+    if math.abs((target.sizeZ or 0) - size.Z) > tol then
+        return false
+    end
+    return true
+end
+
+-- Ближайшая цель с ТЕМ ЖЕ именем и классом в радиусе допуска.
+-- Для обычных целей радиус 8, для закреплённых — 4 плюс обязательное
+-- совпадение размера, иначе под «Part» уедет соседний парт.
+function Farm.ClearMatch(cells, object, position, size)
+    local radius = Farm.ClearTolerance
+    local span = math.max(1, math.ceil(radius / 8))
+    local cx = math.floor(position.X / 8)
+    local cy = math.floor(position.Y / 8)
+    local cz = math.floor(position.Z / 8)
+    local best, bestDist = nil, math.huge
+    for dx = -span, span do
+        for dy = -span, span do
+            for dz = -span, span do
+                local bucket = cells[string.format("%d|%d|%d", cx + dx, cy + dy, cz + dz)]
+                if bucket then
+                    for _, target in ipairs(bucket) do
+                        if not target.done
+                            and target.class == object.ClassName
+                            and target.name == object.Name then
+                            local limit = radius
+                            if target.pinned then
+                                limit = Farm.ClearStrictTolerance
+                            end
+                            local ddx = target.x - position.X
+                            local ddy = target.y - position.Y
+                            local ddz = target.z - position.Z
+                            local d = ddx * ddx + ddy * ddy + ddz * ddz
+                            if d <= limit * limit and d < bestDist then
+                                local fits = true
+                                if target.pinned then
+                                    if not size then
+                                        size = Farm.ClearSizeOf(object)
+                                    end
+                                    fits = Farm.ClearSizeClose(target, size)
+                                end
+                                if fits then
+                                    best, bestDist = target, d
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Один проход по Workspace.
+-- Удаляется только объект, у которого совпали ИМЯ и КЛАСС из списка, плюс
+-- либо позиция, либо (если позиции не совпали) размер. Ничего чужого.
+function Farm.ClearPass()
+    local list = Farm.ClearParse()
+    local cells, names, classes, sizes = Farm.ClearIndex(list)
+    Farm.ClearTotal = #list
+    local blocked = Farm.ClearBlocked()
+
+    local ok, items = pcall(function()
+        return Workspace:GetDescendants()
+    end)
+    if not ok or not items then
+        Farm.ClearReport = "Workspace:GetDescendants() не сработал"
+        return 0
+    end
+
+    -- Части, на которых висит интерфейс или кнопка, не трогаем никогда.
+    for _, item in ipairs(items) do
+        if item:IsA("SurfaceGui") or item:IsA("BillboardGui") or item:IsA("ClickDetector") then
+            local host = item.Parent
+            if host then
+                blocked[host] = true
+            end
+        end
+    end
+
+    local removed, seen, byPos, bySize, byPin = 0, 0, 0, 0, 0
+    local resolved = 0
+
+    -- Проход 1: имя + класс + позиция (для закреплённых — ещё и размер).
+    for _, item in ipairs(items) do
+        if resolved >= #list then
+            break
+        end
+        if item.Parent and item:IsDescendantOf(Workspace) and not Farm.ClearForbidden(item, blocked) then
+            local isPart = item:IsA("BasePart")
+            local isModel = item:IsA("Model")
+            if (isPart or isModel) and classes[item.ClassName] then
+                seen = seen + 1
+                if seen % 3000 == 0 then
+                    task.wait()
+                end
+                if names[item.Name .. "|" .. item.ClassName] then
+                    local position = Farm.ClearPosition(item)
+                    if position then
+                        local target = Farm.ClearMatch(cells, item, position, nil)
+                        if target and Farm.ClearDetach(item, blocked) then
+                            target.done = true
+                            removed = removed + 1
+                            resolved = resolved + 1
+                            if target.pinned then
+                                byPin = byPin + 1
+                            else
+                                byPos = byPos + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Проход 2: по подписи «имя + класс + размер». Нужен, когда карта стоит
+    -- не там, где записана. На повторных проходах по уже чистой карте не
+    -- включается, иначе начнёт добивать похожие объекты.
+    -- Закреплённые цели попадают сюда только если по позиции не нашлось ни
+    -- одной: значит карта действительно уехала, и иначе они просто не удалятся.
+    if byPos > 0 then
+        Farm.ClearSizeUsed = true
+    end
+    if byPin > 0 then
+        Farm.ClearPinnedSizeUsed = true
+    end
+    local allowSize = byPos > 0 or not Farm.ClearSizeUsed
+    local allowPinned = byPin == 0 and not Farm.ClearPinnedSizeUsed
+    if resolved < #list and allowSize then
+        local world, need = {}, {}
+        for _, item in ipairs(items) do
+            if item.Parent and item:IsDescendantOf(Workspace)
+                and (item:IsA("BasePart") or item:IsA("Model"))
+                and classes[item.ClassName]
+                and not Farm.ClearForbidden(item, blocked) then
+                local key = item.Name .. "|" .. item.ClassName
+                if names[key] then
+                    local size = Farm.ClearSizeOf(item)
+                    if size then
+                        local sig = string.format("%s|%d|%d|%d", key,
+                            math.floor(size.X + 0.5), math.floor(size.Y + 0.5), math.floor(size.Z + 0.5))
+                        local bucket = world[sig]
+                        if not bucket then
+                            bucket = {}
+                            world[sig] = bucket
+                        end
+                        bucket[#bucket + 1] = item
+                    end
+                end
+            end
+        end
+        for _, target in ipairs(list) do
+            if not target.done and (allowPinned or not target.pinned) then
+                local sig = Farm.ClearSigOf(target)
+                need[sig] = (need[sig] or 0) + 1
+            end
+        end
+        for sig, count in pairs(need) do
+            local bucket = world[sig]
+            -- Удаляем, только если объектов с такой подписью не больше, чем
+            -- целей: лишние объекты этого имени и размера не трогаем.
+            if bucket and count > 0 and #bucket > 0 and #bucket <= count then
+                local deleted = 0
+                for _, item in ipairs(bucket) do
+                    if item.Parent and Farm.ClearDetach(item, blocked) then
+                        removed = removed + 1
+                        deleted = deleted + 1
+                        bySize = bySize + 1
+                    end
+                end
+                local marked = 0
+                for _, target in ipairs(list) do
+                    if marked >= deleted then
+                        break
+                    end
+                    if not target.done and Farm.ClearSigOf(target) == sig then
+                        target.done = true
+                        resolved = resolved + 1
+                        marked = marked + 1
+                    end
+                end
+            end
+        end
+    end
+
+    -- Отчёт: что нашли, а каких имён в мире нет.
+    local keyTotal, keyDone = {}, {}
+    for _, target in ipairs(list) do
+        local key = target.name .. "|" .. target.class
+        keyTotal[key] = true
+        if target.done then
+            keyDone[key] = (keyDone[key] or 0) + 1
+        end
+    end
+    local missing = {}
+    for key in pairs(keyTotal) do
+        if not keyDone[key] then
+            local name, class = string.match(key, "^([^|]+)|(.+)$")
+            missing[#missing + 1] = tostring(name) .. " (" .. tostring(class) .. ")"
+        end
+    end
+
+    Farm.ClearRemoved = removed
+    Farm.ClearResolved = resolved
+    Farm.ClearPinnedResolved = byPin
+    Farm.ClearReport = string.format(
+        "объектов %d | целей %d из %d | позиция %d, закреп %d, размер %d | просмотрено %d",
+        removed, resolved, #list, byPos, byPin, bySize, seen)
+    print("[Clear] " .. Farm.ClearReport)
+    if #missing > 0 then
+        table.sort(missing)
+        print("[Clear] не найдено (" .. tostring(#missing) .. "): " .. table.concat(missing, ", "))
+    end
+    FarmReportFor("door", "чистка карты: " .. Farm.ClearReport)
+    return removed
+end
+
+-- Обёртка: что бы ни сломалось внутри, флаг прохода сбрасывается.
+function Farm.ClearOnce()
+    if Farm.ClearRunning then
+        return Farm.ClearRemoved
+    end
+    Farm.ClearRunning = true
+    local ok, result = pcall(Farm.ClearPass)
+    Farm.ClearRunning = false
+    if not ok then
+        Farm.ClearReport = "ошибка прохода: " .. tostring(result)
+        print("[Clear] " .. Farm.ClearReport)
+        FarmReportFor("door", "чистка карты: " .. Farm.ClearReport)
+        return 0
+    end
+    return result or 0
+end
+
+-- Автозапуск: несколько проходов подряд, потому что части догружаются
+-- стримингом уже после инжекта.
+function Farm.ClearAutoRun()
+    if not Farm.ClearAuto then
+        return
+    end
+    task.spawn(function()
+        local idle = 0
+        for attempt = 1, 8 do
+            task.wait(attempt == 1 and 2 or 5)
+            if not Farm.ClearAuto then
+                return
+            end
+            local added = Farm.ClearOnce() or 0
+            if added == 0 then
+                idle = idle + 1
+                if idle >= 2 then
+                    return
+                end
+            else
+                idle = 0
+            end
+        end
+    end)
+end
+
+-- Промпты (игровые кнопки, двери) срабатывают сквозь стены и игроков.
+-- Дистанцию не трогаем: MaxActivationDistance остаётся обычным.
+Farm.PromptPatchCount = 0
+Farm.PromptPatchOn = false
+
+function Farm.PatchPrompts()
+    local ok, items = pcall(function()
+        return Workspace:GetDescendants()
+    end)
+    if not ok or not items then
+        return 0
+    end
+    local patched = 0
+    for _, item in ipairs(items) do
+        if item:IsA("ProximityPrompt") then
+            local okSet = pcall(function()
+                item.RequiresLineOfSight = false
+            end)
+            if okSet then
+                patched = patched + 1
+            end
+        end
+    end
+    Farm.PromptPatchCount = patched
+    return patched
+end
+
+function Farm.StartPromptPatch()
+    if Farm.PromptPatchOn then
+        return
+    end
+    Farm.PromptPatchOn = true
+    Farm.PatchPrompts()
+    -- Новые промпты (двери, кнопки) патчим сразу, как только они появились.
+    if not Farm.PromptConn then
+        local ok, conn = pcall(function()
+            return Workspace.DescendantAdded:Connect(function(item)
+                if not Farm.PromptPatchOn then
+                    return
+                end
+                if item:IsA("ProximityPrompt") then
+                    pcall(function()
+                        item.RequiresLineOfSight = false
+                    end)
+                end
+            end)
+        end)
+        if ok then
+            Farm.PromptConn = conn
+        end
+    end
+    -- И редкая страховка на случай, если соединение не сработало.
+    task.spawn(function()
+        while Farm.PromptPatchOn do
+            task.wait(10)
+            if Farm.PromptPatchOn then
+                Farm.PatchPrompts()
+            end
+        end
+    end)
+end
+
+function Farm.StopPromptPatch()
+    Farm.PromptPatchOn = false
+end
+
+--==========================================================================
+-- Промпты вне экрана
+-- Движок фокусирует только тот промпт, который попал в кадр. Кнопка за
+-- спиной или за краем экрана не фокусируется, и нажатие уходит в пустоту.
+-- Поэтому клавишу слушаем сами: если движок её не обработал, ищем ближайший
+-- промпт с той же клавишей в пределах ЕГО ЖЕ MaxActivationDistance и дёргаем
+-- напрямую. Дистанцию по-прежнему не расширяем.
+--==========================================================================
+
+Farm.PromptAnywhereOn = false
+Farm.PromptFocus = nil
+Farm.PromptFocusSeen = false
+Farm.PromptFocusBound = false
+Farm.PromptLastFire = 0
+Farm.PromptFireCount = 0
+Farm.PromptCache = {}
+Farm.PromptCacheAt = 0
+
+-- Кэш промптов: полный обход Workspace на каждое нажатие клавиши слишком
+-- дорогой, поэтому список обновляется не чаще раза в 3 секунды.
+function Farm.RefreshPromptCache()
+    local list = {}
+    local ok, items = pcall(function()
+        return Workspace:GetDescendants()
+    end)
+    if ok and items then
+        for _, item in ipairs(items) do
+            if item:IsA("ProximityPrompt") then
+                list[#list + 1] = item
+            end
+        end
+    end
+    Farm.PromptCache = list
+    Farm.PromptCacheAt = os.clock()
+    return list
+end
+
+function Farm.PromptCached()
+    if os.clock() - Farm.PromptCacheAt > 3 then
+        return Farm.RefreshPromptCache()
+    end
+    return Farm.PromptCache
+end
+
+-- Промпт сам не BasePart, поэтому поднимаемся до ближайшей части-хозяина:
+-- именно по ней считается дистанция.
+function Farm.PromptAnchor(prompt)
+    local node = prompt.Parent
+    local guard = 0
+    while node and not node:IsA("BasePart") and guard < 8 do
+        guard = guard + 1
+        node = node.Parent
+    end
+    if node and node:IsA("BasePart") then
+        return node
+    end
+    return nil
+end
+
+-- Ближайший промпт с нужной клавишей, до которого реально можно дотянуться.
+-- Камера здесь не участвует вообще.
+function Farm.FirePromptKey(key)
+    if os.clock() - Farm.PromptLastFire < 0.25 then
+        return false
+    end
+    local root = FarmRoot()
+    local origin = root and root.Position or nil
+    local best, bestDist = nil, math.huge
+    for _, prompt in ipairs(Farm.PromptCached()) do
+        if prompt.Parent and prompt.Enabled and prompt.KeyboardKeyCode == key then
+            local part = Farm.PromptAnchor(prompt)
+            if part then
+                local dist = 0
+                if origin then
+                    dist = (part.Position - origin).Magnitude
+                end
+                if dist <= Farm.PromptReach(prompt) and dist < bestDist then
+                    best, bestDist = prompt, dist
+                end
+            end
+        end
+    end
+    if not best then
+        return false
+    end
+    Farm.PromptLastFire = os.clock()
+    local fired = Farm.TriggerPrompt(best)
+    if fired then
+        Farm.PromptFireCount = Farm.PromptFireCount + 1
+    end
+    return fired
+end
+
+-- Кнопка «дёрнуть ближайший промпт»: ищет по клавише ближайшего из списка.
+function Farm.FireNearestPrompt()
+    local root = FarmRoot()
+    local origin = root and root.Position or nil
+    local best, bestDist = nil, math.huge
+    for _, prompt in ipairs(Farm.PromptCached()) do
+        if prompt.Parent and prompt.Enabled then
+            local part = Farm.PromptAnchor(prompt)
+            if part then
+                local dist = 0
+                if origin then
+                    dist = (part.Position - origin).Magnitude
+                end
+                if dist <= Farm.PromptReach(prompt) and dist < bestDist then
+                    best, bestDist = prompt, dist
+                end
+            end
+        end
+    end
+    if not best then
+        return false
+    end
+    return Farm.FirePromptKey(best.KeyboardKeyCode)
+end
+
+function Farm.PromptBindFocus()
+    if Farm.PromptFocusBound then
+        return
+    end
+    Farm.PromptFocusBound = true
+    local service = game:GetService("ProximityPromptService")
+    pcall(function()
+        service.PromptShown:Connect(function(prompt)
+            Farm.PromptFocusSeen = true
+            Farm.PromptFocus = prompt
+        end)
+        service.PromptHidden:Connect(function(prompt)
+            Farm.PromptFocusSeen = true
+            if Farm.PromptFocus == prompt then
+                Farm.PromptFocus = nil
+            end
+        end)
+        -- Движок уже сработал - ставим метку, чтобы не выстрелить второй раз
+        -- и не переключить тумблер обратно.
+        service.PromptTriggered:Connect(function()
+            Farm.PromptLastFire = os.clock()
+        end)
+    end)
+end
+
+function Farm.StartPromptAnywhere()
+    if Farm.PromptAnywhereOn then
+        return
+    end
+    Farm.PromptAnywhereOn = true
+    Farm.PromptBindFocus()
+    Farm.RefreshPromptCache()
+    local ok, conn = pcall(function()
+        return game:GetService("UserInputService").InputBegan:Connect(function(input, processed)
+            if not Farm.PromptAnywhereOn then
+                return
+            end
+            -- Движок нажатие уже обработал (промпт был в фокусе) - не дублируем.
+            if processed then
+                return
+            end
+            if input.UserInputType ~= Enum.UserInputType.Keyboard then
+                return
+            end
+            -- Если сервис отдаёт фокус, доверяем ему полностью.
+            if Farm.PromptFocusSeen and Farm.PromptFocus and Farm.PromptFocus.Parent then
+                return
+            end
+            Farm.FirePromptKey(input.KeyCode)
+        end)
+    end)
+    if ok then
+        Farm.PromptAnywhereConn = conn
+    end
+    -- Двери и кнопки появляются по ходу игры, поэтому список обновляем по кругу.
+    task.spawn(function()
+        while Farm.PromptAnywhereOn do
+            task.wait(3)
+            if Farm.PromptAnywhereOn then
+                Farm.RefreshPromptCache()
+            end
+        end
+    end)
+end
+
+function Farm.StopPromptAnywhere()
+    Farm.PromptAnywhereOn = false
+    if Farm.PromptAnywhereConn then
+        pcall(function()
+            Farm.PromptAnywhereConn:Disconnect()
+        end)
+        Farm.PromptAnywhereConn = nil
     end
 end
 
@@ -6237,20 +7674,36 @@ function Farm.StopCrystal()
     FarmReportFor("crystal", "crystal farm stopped")
 end
 
+-- Anti-AFK --------------------------------------------------------------------
+-- Взято из QuantumOnyx: на каждый Idled сначала CaptureController, и только
+-- потом клик. Если кликнуть до захвата контроллера, Roblox его не засчитывает
+-- и всё равно выкидывает за неактивность.
+function Farm.AntiAfkPoke()
+    local ok = pcall(function()
+        local virtualUser = game:GetService("VirtualUser")
+        virtualUser:CaptureController()
+        virtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+    if not ok then
+        pcall(function()
+            local virtualUser = game:GetService("VirtualUser")
+            virtualUser:CaptureController()
+            virtualUser:Button2Down(Vector2.new(0, 0))
+            task.wait(0.1)
+            virtualUser:Button2Up(Vector2.new(0, 0))
+        end)
+    end
+    Farm.AntiAfkPokes = (Farm.AntiAfkPokes or 0) + 1
+    Farm.AntiAfkLastAt = os.time()
+end
+
 function Farm.SetAntiAfk(enabled)
     if enabled then
         if Farm.AntiAfkConnection then
             return
         end
         Farm.AntiAfkConnection = LocalPlayer.Idled:Connect(function()
-            pcall(function()
-                local virtualUser = game:GetService("VirtualUser")
-                virtualUser:ClickButton2(Vector2.new(0, 0))
-                virtualUser:CaptureController()
-                virtualUser:Button2Down(Vector2.new(0, 0))
-                task.wait(0.1)
-                virtualUser:Button2Up(Vector2.new(0, 0))
-            end)
+            Farm.AntiAfkPoke()
         end)
     else
         if Farm.AntiAfkConnection then
@@ -6548,6 +8001,7 @@ do
         local content = tostring(data.ContentText or data.Content or "")
         if IsCooldownToast(data) then
             Items.LastToastText = content
+            Farm.LastToastAt = tick()
             -- Only react while the door farm is actually running.
             if not Farm.DoorRunning then
                 return
@@ -6559,6 +8013,8 @@ do
             Farm.DoorCooldownHitAt = tick()
             return
         end
+        -- Any other toast is a reaction from the door: it proves the prompt fired.
+        Farm.LastToastAt = tick()
         if not State.DoorRewards then
             return
         end
@@ -7238,6 +8694,225 @@ do
 
     Hub.Fullbright = Fullbright
 
+    -- Field of view ------------------------------------------------------------
+    -- Движок режет Camera.FieldOfView до 120 - это его внутренний лимит.
+    -- Ползунок идёт до 200, и всё что выше 120 добирается расширителем:
+    -- камера отъезжает назад по своему взгляду ровно настолько, чтобы видимый
+    -- угол совпал с запрошенным. До 120 всё выставляется честно, через камеру.
+    -- Геометрия перспективы физически не даёт угла больше ~176°, поэтому
+    -- отъезд ограничен - дальше просто упираемся в потолок, а не улетаем
+    -- камерой за карту.
+    local Fov = {
+        value = 70,
+        applied = 70,
+        capped = false,
+        on = false,
+        conn = nil,
+        original = nil,
+        message = "FOV not applied",
+        dolly = 0,
+        baseCFrame = nil,
+        lastPosition = nil,
+        bound = false,
+    }
+
+    local FovRun = game:GetService("RunService")
+
+    local FOV_CAP = 120          -- предел самого движка
+    local FOV_MAX = 200          -- предел ползунка
+    local FOV_REF_DISTANCE = 26  -- дистанция, на которой считаем «ширину» кадра
+    local FOV_DOLLY_MAX = 120    -- максимум отъезда камеры, студов
+    local FOV_BIND_NAME = "StarHubFovExtension"
+
+    function Fov.camera()
+        local ok, cam = pcall(function()
+            return Workspace.CurrentCamera
+        end)
+        if ok then
+            return cam
+        end
+        return nil
+    end
+
+    function Fov.read(cam)
+        local ok, value = pcall(function()
+            return cam.FieldOfView
+        end)
+        if ok then
+            return tonumber(value) or 0
+        end
+        return 0
+    end
+
+    -- Пробуем всё, что может дать значение выше 120, и возвращаем то, что
+    -- действительно оказалось в камере.
+    function Fov.push(cam, target)
+        local goal = math.clamp(tonumber(target) or 70, 1, FOV_CAP)
+        pcall(function()
+            cam.FieldOfView = goal
+        end)
+        local actual = Fov.read(cam)
+        if actual >= goal - 0.5 then
+            return actual
+        end
+        if type(sethiddenproperty) == "function" then
+            pcall(sethiddenproperty, cam, "FieldOfView", goal)
+            actual = Fov.read(cam)
+            if actual >= goal - 0.5 then
+                return actual
+            end
+        end
+        return actual
+    end
+
+    -- Тангенс половины угла. Выше 88° перспектива вырождается, поэтому
+    -- подрезаем: иначе счёт уходит в бесконечность.
+    local function halfTan(deg)
+        return math.tan(math.rad(math.min(deg * 0.5, 88)))
+    end
+
+    -- Сколько студов отъехать назад, чтобы видимый угол совпал с target.
+    function Fov.dollyFor(target)
+        local wanted = math.clamp(tonumber(target) or 70, 1, FOV_MAX)
+        if wanted <= FOV_CAP then
+            return 0
+        end
+        local ratio = halfTan(wanted) / halfTan(FOV_CAP)
+        local dolly = FOV_REF_DISTANCE * math.max(0, ratio - 1)
+        return math.min(dolly, FOV_DOLLY_MAX)
+    end
+
+    function Fov.apply(value)
+        local target = math.clamp(tonumber(value) or 70, 1, FOV_MAX)
+        Fov.value = target
+        local cam = Fov.camera()
+        if not cam then
+            Fov.message = "no camera yet"
+            return false
+        end
+        if not Fov.original then
+            local current = Fov.read(cam)
+            if current > 0 then
+                Fov.original = current
+            end
+        end
+        local native = math.min(target, FOV_CAP)
+        local actual = Fov.push(cam, native)
+        Fov.applied = actual
+        Fov.capped = target > actual + 0.5
+        Fov.dolly = (target > FOV_CAP) and Fov.dollyFor(target) or 0
+        Fov.lastPosition = nil
+        if Fov.dolly > 0.05 then
+            Fov.message = string.format(
+                "%d° (engine %d° + extender %d studs)",
+                target,
+                actual,
+                math.floor(Fov.dolly + 0.5)
+            )
+        elseif Fov.capped then
+            Fov.message = string.format("asked %d, engine gave %d - hard cap is 120", target, actual)
+        else
+            Fov.message = string.format("%d degrees", actual)
+        end
+        return true
+    end
+
+    -- Каждый кадр после камеры игры: держим нативное значение и отъезд.
+    function Fov.step()
+        if not Fov.on then
+            return
+        end
+        local cam = Fov.camera()
+        if not cam then
+            return
+        end
+        local native = math.min(Fov.value, FOV_CAP)
+        if math.abs(Fov.read(cam) - native) > 0.1 then
+            Fov.push(cam, native)
+        end
+        local dolly = Fov.dolly
+        if dolly <= 0.05 then
+            return
+        end
+        local cf = cam.CFrame
+        local base = cf
+        -- Если камера с прошлого кадра не двигалась, значит в ней всё ещё наш
+        -- собственный сдвиг - считаем от исходной точки, иначе отъезд накопим.
+        if Fov.lastPosition and (cf.Position - Fov.lastPosition).Magnitude < 0.01 then
+            base = Fov.baseCFrame or cf
+        end
+        Fov.baseCFrame = base
+        local shifted = base * CFrame.new(0, 0, dolly)
+        Fov.lastPosition = shifted.Position
+        pcall(function()
+            cam.CFrame = shifted
+        end)
+    end
+
+    function Fov.bind()
+        if Fov.bound then
+            return
+        end
+        Fov.bound = true
+        pcall(function()
+            FovRun:BindToRenderStep(FOV_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, Fov.step)
+        end)
+    end
+
+    function Fov.unbind()
+        if not Fov.bound then
+            return
+        end
+        Fov.bound = false
+        pcall(function()
+            FovRun:UnbindFromRenderStep(FOV_BIND_NAME)
+        end)
+    end
+
+    function Fov.setEnabled(enabled)
+        Fov.on = enabled == true
+        if Fov.on then
+            Fov.apply(Fov.value)
+            Fov.bind()
+        else
+            Fov.unbind()
+            Fov.dolly = 0
+            Fov.lastPosition = nil
+            Fov.baseCFrame = nil
+            local cam = Fov.camera()
+            if cam and Fov.original then
+                pcall(function()
+                    cam.FieldOfView = Fov.original
+                end)
+            end
+        end
+    end
+
+    function Fov.refresh()
+        if Fov.on then
+            Fov.apply(Fov.value)
+        end
+    end
+
+    function Fov.reset()
+        Fov.unbind()
+        Fov.on = false
+        Fov.dolly = 0
+        Fov.lastPosition = nil
+        Fov.baseCFrame = nil
+        local cam = Fov.camera()
+        if cam and Fov.original then
+            pcall(function()
+                cam.FieldOfView = Fov.original
+            end)
+        end
+        Fov.applied = Fov.original or 70
+        Fov.capped = false
+        Fov.message = "FOV restored"
+    end
+
+    Hub.Fov = Fov
+
     -- Applies a saved snapshot once the hub is up (crash-loop protected).
     task.delay(2, function()
         if State.Running then
@@ -7601,6 +9276,8 @@ State.FullbrightShadows = Config.FullbrightShadows == true
 State.FullbrightExposure = math.clamp(tonumber(Config.FullbrightExposure) or 0, -3, 3)
 State.FullbrightNoAtmosphere = Config.FullbrightNoAtmosphere ~= false
 State.FullbrightNoPost = Config.FullbrightNoPost ~= false
+State.FovEnabled = Config.FovEnabled == true
+State.FovValue = math.clamp(tonumber(Config.FovValue) or 70, 1, 200)
 State.FpsCap = math.max(0, math.floor(tonumber(Config.FpsCap) or 240))
 if State.FpsCap > 0 and State.FpsCap < 5 then
     State.FpsCap = 5
@@ -7654,6 +9331,8 @@ local function SaveConfig()
         FullbrightExposure = State.FullbrightExposure,
         FullbrightNoAtmosphere = State.FullbrightNoAtmosphere,
         FullbrightNoPost = State.FullbrightNoPost,
+        FovEnabled = State.FovEnabled,
+        FovValue = State.FovValue,
         FpsCap = State.FpsCap,
         FpsCapLast = State.FpsCapLast,
     }
@@ -8344,7 +10023,7 @@ local FarmTab = Window:CreateTab({
 })
 
 local DoorBox = FarmTab:CreateGroupBox("Left", "Auto Door Farm", "DOORS", StarHubUI.Icons.Teleport)
-DoorBox:AddToggle("Enable Door Farm", "Only Door1 ... Door50 - every other name is ignored", State.DoorFarm, function(value)
+DoorBox:AddToggle("Enable Door Farm", "Walks the recorded point list", State.DoorFarm, function(value)
     State.DoorFarm = value == true
     if State.DoorFarm then
         Farm.StartDoor()
@@ -8352,6 +10031,49 @@ DoorBox:AddToggle("Enable Door Farm", "Only Door1 ... Door50 - every other name 
         Farm.StopDoor()
     end
     QueueSave()
+end)
+DoorBox:AddDropdown("Teleport Pose", {
+    "Stand",
+    "Lie on back",
+    "Lie on front",
+    "Lie on left side",
+    "Lie on right side",
+    "Head down",
+}, State.DoorPose or "Stand", function(value)
+    State.DoorPose = tostring(value)
+    QueueSave()
+end)
+DoorBox:AddToggle("Face Away From Door", "Flips the character 180 degrees - which side faces the door", State.DoorFaceAway == true, function(value)
+    State.DoorFaceAway = value == true
+    QueueSave()
+end)
+DoorBox:AddSlider("Teleport Offset X", -20, 20, State.DoorOffsetX or 0, "ST", function(value)
+    State.DoorOffsetX = math.clamp(math.floor((tonumber(value) or 0) + 0.5), -20, 20)
+    QueueSave()
+end)
+DoorBox:AddSlider("Teleport Offset Y", -10, 30, State.DoorOffsetY or 2, "ST", function(value)
+    State.DoorOffsetY = math.clamp(math.floor((tonumber(value) or 0) + 0.5), -10, 30)
+    QueueSave()
+end)
+DoorBox:AddSlider("Teleport Offset Z", -20, 20, State.DoorOffsetZ or 0, "ST", function(value)
+    State.DoorOffsetZ = math.clamp(math.floor((tonumber(value) or 0) + 0.5), -20, 20)
+    QueueSave()
+end)
+DoorBox:AddActionRow("Test Teleport", "Jumps to the current point with these offsets and pose", StarHubUI.Icons.Teleport, function()
+    local points = Farm.CollectPoints()
+    if #points == 0 then
+        Notify("Door Farm", "no points")
+        return
+    end
+    local index = math.clamp(tonumber(Farm.DoorCursor) or 1, 1, #points)
+    local chosen = points[index]
+
+    if Farm.TeleportToPoint(chosen) then
+        Notify("Door Farm", tostring(chosen.Name) .. " | " .. tostring(State.DoorPose)
+            .. " | " .. tostring(State.DoorOffsetX) .. "/" .. tostring(State.DoorOffsetY) .. "/" .. tostring(State.DoorOffsetZ))
+    else
+        Notify("Door Farm", "could not teleport")
+    end
 end)
 DoorBox:AddSlider("Interval Between Doors", 1, 60, State.DoorInterval, "SEC", function(value)
     State.DoorInterval = math.clamp(math.floor((tonumber(value) or 10) + 0.5), 1, 60)
@@ -8361,22 +10083,66 @@ DoorBox:AddSlider("Door Cooldown", 1, 60, math.floor(State.DoorCooldown / 60 + 0
     State.DoorCooldown = math.clamp(math.floor((tonumber(value) or 30) + 0.5), 1, 60) * 60
     QueueSave()
 end)
-Gui.DoorFarmStatus = MakeInfoRow(DoorBox, "Doors found: 0", "Idle", StarHubUI.Icons.Teleport)
-DoorBox:AddActionRow("Scan Doors", "Lists exactly which doors the farm will use", StarHubUI.Icons.Search, function()
-    local doors = FarmCollect("door")
-    local names = {}
-    for index, door in ipairs(doors) do
-        names[index] = tostring(door.Name)
+Gui.DoorFarmStatus = MakeInfoRow(DoorBox, "Points: 0", "Idle", StarHubUI.Icons.Teleport)
+DoorBox:AddActionRow("Scan Points", "Lists exactly which coordinates the farm will use", StarHubUI.Icons.Search, function()
+    local points = Farm.CollectPoints()
+    local lines = {}
+    for index, point in ipairs(points) do
+        lines[index] = tostring(point.Position.X) .. ", " .. tostring(point.Position.Y) .. ", " .. tostring(point.Position.Z)
     end
-    print("[Door Farm] " .. tostring(#doors) .. " doors: " .. table.concat(names, ", "))
-    local preview = table.concat(names, ", ", 1, math.min(#names, 18))
-    if #names > 18 then
+    print("[Door Farm] " .. tostring(#points) .. " points: " .. table.concat(lines, " | "))
+    local preview = table.concat(lines, " | ", 1, math.min(#lines, 4))
+    if #lines > 4 then
         preview = preview .. " ..."
     end
-    Notify("Doors: " .. tostring(#doors), preview ~= "" and preview or "nothing found")
+    Notify("Points: " .. tostring(#points), preview ~= "" and preview or "nothing found")
 end)
-DoorBox:AddActionRow("Show Door Status", "Prints how many doors were found", StarHubUI.Icons.Dashboard, function()
-    Notify("Door Farm", tostring(Farm.Message) .. " | doors: " .. tostring(Farm.DoorCount))
+DoorBox:AddActionRow("Show Door Status", "Prints how many points were found", StarHubUI.Icons.Dashboard, function()
+    Notify("Door Farm", tostring(Farm.Message) .. " | points: " .. tostring(Farm.DoorCount))
+end)
+DoorBox:AddToggle("Prompts Through Walls", "Proximity prompts work through walls and players - distance stays normal", State.PromptWalls ~= false, function(value)
+    State.PromptWalls = value == true
+    if State.PromptWalls then
+        Farm.StartPromptPatch()
+    else
+        Farm.StopPromptPatch()
+    end
+    QueueSave()
+end)
+DoorBox:AddToggle("Auto Clear Map", "Deletes only the 168 recorded objects, right after inject", State.ClearMapAuto ~= false, function(value)
+    State.ClearMapAuto = value == true
+    Farm.ClearAuto = State.ClearMapAuto
+    if State.ClearMapAuto then
+        Farm.ClearAutoRun()
+    end
+    QueueSave()
+end)
+Gui.ClearStatus = MakeInfoRow(DoorBox, "Clear map: not run", "168 objects from the log", StarHubUI.Icons.Skull)
+DoorBox:AddActionRow("Clear Map Once", "Deletes only the 168 recorded objects - nothing else", StarHubUI.Icons.Skull, function()
+    local removed = Farm.ClearOnce()
+    if removed > 0 then
+        Notify("Clear map", tostring(Farm.ClearResolved) .. " / " .. tostring(Farm.ClearTotal) .. " objects")
+    else
+        Notify("Clear map", "0 / " .. tostring(Farm.ClearTotal) .. " - see console")
+    end
+    print("[Clear] " .. tostring(Farm.ClearReport or "no report"))
+end)
+DoorBox:AddActionRow("Patch Prompts Now", "Sets RequiresLineOfSight = false on every prompt right now", StarHubUI.Icons.Search, function()
+    local count = Farm.PatchPrompts()
+    Notify("Prompts", tostring(count) .. " prompts patched")
+end)
+DoorBox:AddToggle("Prompts Off-Screen", "The prompt key works even when the switch is behind you or off the screen", State.PromptAnywhere ~= false, function(value)
+    State.PromptAnywhere = value == true
+    if State.PromptAnywhere then
+        Farm.StartPromptAnywhere()
+    else
+        Farm.StopPromptAnywhere()
+    end
+    QueueSave()
+end)
+DoorBox:AddActionRow("Fire Nearest Prompt", "Triggers the closest prompt in range, camera ignored", StarHubUI.Icons.Zap, function()
+    local fired = Farm.FireNearestPrompt()
+    Notify("Prompts", fired and ("fired | total: " .. tostring(Farm.PromptFireCount)) or "nothing in range")
 end)
 
 local CrystalBox = FarmTab:CreateGroupBox("Right", "Crystal Farm", "CRYSTALS", StarHubUI.Icons.Save)
@@ -8416,10 +10182,15 @@ CrystalBox:AddActionRow("Show Crystal Status", "Prints how many crystals were fo
 end)
 
 local FarmUtilBox = FarmTab:CreateGroupBox("Right", "Utility", "AFK", StarHubUI.Icons.Check)
-FarmUtilBox:AddToggle("Anti-AFK", "Nudges the client so it never idles out", State.AntiAfk, function(value)
+FarmUtilBox:AddToggle("Anti-AFK", "Captures the controller and clicks when Roblox counts you as idle", State.AntiAfk, function(value)
     State.AntiAfk = value == true
     Farm.SetAntiAfk(State.AntiAfk)
     QueueSave()
+end)
+Gui.AntiAfkStatus = MakeInfoRow(FarmUtilBox, "Anti-AFK: off", "0 pokes", StarHubUI.Icons.Check)
+FarmUtilBox:AddActionRow("Test Anti-AFK", "Sends one poke right now so you can see it working", StarHubUI.Icons.Zap, function()
+    Farm.AntiAfkPoke()
+    Notify("Anti-AFK", "poked " .. tostring(Farm.AntiAfkPokes or 0) .. " times total")
 end)
 FarmUtilBox:AddActionRow("Stop Everything", "Stops both farms immediately", StarHubUI.Icons.Skull, function()
     Farm.StopDoor()
@@ -8484,12 +10255,25 @@ Hub.Items.Listener = PaintItemStatus
 
 FarmStatusListener = function()
     if Gui.DoorFarmStatus then
-        Gui.DoorFarmStatus:SetTitle("Doors found: " .. tostring(Farm.DoorCount))
+        Gui.DoorFarmStatus:SetTitle("Points: " .. tostring(Farm.DoorCount))
         Gui.DoorFarmStatus:SetDesc(tostring(Farm.DoorMessage or "Idle"))
     end
     if Gui.CrystalFarmStatus then
         Gui.CrystalFarmStatus:SetTitle("Crystals found: " .. tostring(Farm.CrystalCount))
         Gui.CrystalFarmStatus:SetDesc(tostring(Farm.CrystalMessage or "Idle"))
+    end
+    if Gui.ClearStatus then
+        if (Farm.ClearResolved or 0) > 0 then
+            Gui.ClearStatus:SetTitle(string.format("Clear map: %d / %d objects",
+                Farm.ClearResolved, Farm.ClearTotal or 0))
+            Gui.ClearStatus:SetDesc(tostring(Farm.ClearReport or "done - rejoin to bring it back"))
+        elseif Farm.ClearReport then
+            Gui.ClearStatus:SetTitle("Clear map: 0 matched")
+            Gui.ClearStatus:SetDesc(tostring(Farm.ClearReport))
+        else
+            Gui.ClearStatus:SetTitle("Clear map: not run")
+            Gui.ClearStatus:SetDesc("168 objects from the log")
+        end
     end
     pcall(PaintItemStatus)
 end
@@ -8974,9 +10758,43 @@ do
         QueueSave()
     end)
 
+    -- Field of view ------------------------------------------------------------
+    local FovBox = LightTab:CreateGroupBox("Right", "Field Of View", "CAMERA", StarHubUI.Icons.Visuals)
+    local FovToggle = FovBox:AddToggle("Enable FOV", "Overrides the camera field of view", State.FovEnabled, function(value)
+        State.FovEnabled = value == true
+        Hub.Fov.setEnabled(State.FovEnabled)
+        QueueSave()
+    end)
+    FovBox:AddSlider("Field Of View", 1, 200, State.FovValue, "°", function(value)
+        State.FovValue = math.clamp(math.floor((tonumber(value) or 70) + 0.5), 1, 200)
+        if State.FovEnabled then
+            Hub.Fov.apply(State.FovValue)
+        else
+            FovToggle:Set(true)
+        end
+        QueueSave()
+    end)
+    FovBox:AddActionRow("Apply Now", "Re-pushes the angle into the camera", StarHubUI.Icons.Refresh, function()
+        FovToggle:Set(true)
+        Notify("Field Of View", Hub.Fov.message)
+    end)
+    FovBox:AddActionRow("Reset FOV", "Restores the camera's original angle", StarHubUI.Icons.Refresh, function()
+        Hub.Fov.reset()
+        State.FovEnabled = false
+        pcall(FovToggle.Set, false)
+        Notify("Field Of View", "Camera angle restored.")
+        QueueSave()
+    end)
+
     if State.Fullbright then
         task.defer(function()
             Hub.Fullbright.apply()
+        end)
+    end
+
+    if State.FovEnabled then
+        task.defer(function()
+            Hub.Fov.setEnabled(true)
         end)
     end
 end
@@ -9591,6 +11409,24 @@ if Hub.Config then
     if Hub.Config.Refresh then
         Hub.Config.Refresh()
     end
+end
+
+-- Автоудаление карты запускаем после загрузки конфига, иначе выключенный
+-- тумблер из сохранений не успевает примениться.
+if State.PromptWalls ~= false then
+    Farm.StartPromptPatch()
+end
+
+-- Промпты вне экрана: клавиша срабатывает, даже если кнопка не в кадре.
+if State.PromptAnywhere ~= false then
+    Farm.StartPromptAnywhere()
+end
+
+Farm.ClearAuto = State.ClearMapAuto ~= false
+if Farm.ClearAuto then
+    task.defer(function()
+        Farm.ClearAutoRun()
+    end)
 end
 
 RefreshActionList()
