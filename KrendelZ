@@ -6441,21 +6441,26 @@ do
             return nil
         end
         local kind = nil
-        if lower:find("vip", 1, true) and lower:find("coupon", 1, true) then
+        -- "Premium Upgrade Coupon" is the in-game name for the premium coupon.
+        if lower:find("coupon", 1, true) and (lower:find("premium", 1, true) or lower:find("vip", 1, true)) then
             kind = "VipCoupons"
         elseif lower:find("coupon", 1, true) then
             kind = "Coupons"
         elseif lower:find("cursed", 1, true) or lower:find("%f[%a]keys?%f[%A]") then
             kind = "CursedKeys"
-        elseif lower:find("shard", 1, true) then
+        -- The game calls the shards "Crystals".
+        elseif lower:find("crystal", 1, true) or lower:find("shard", 1, true) then
             kind = "Shards"
-        elseif lower:find("pumpkin", 1, true) then
+        -- The game calls the pumpkins "Jacks".
+        elseif lower:find("%f[%a]jacks?%f[%A]") or lower:find("pumpkin", 1, true) then
             kind = "Pumpkins"
         end
         if not kind then
             return nil
         end
-        local amount = tonumber(lower:match("(%d+)")) or 1
+        local digits = lower:match("(%d[%d,]*)") or ""
+        local cleaned = digits:gsub(",", "")
+        local amount = tonumber(cleaned) or 1
         if amount <= 0 then
             amount = 1
         end
@@ -6470,11 +6475,11 @@ do
         local r = Items.Rewards
         local lines = {
             "**Doors opened:** " .. tostring(r.Doors or 0),
-            "**Shards:** " .. tostring(r.Shards or 0),
+            "**Crystals:** " .. tostring(r.Shards or 0),
             "**Coupons:** " .. tostring(r.Coupons or 0),
-            "**VIP Coupons:** " .. tostring(r.VipCoupons or 0),
+            "**Premium Coupons:** " .. tostring(r.VipCoupons or 0),
             "**Cursed Keys:** " .. tostring(r.CursedKeys or 0),
-            "**Pumpkins:** " .. tostring(r.Pumpkins or 0),
+            "**Jacks:** " .. tostring(r.Pumpkins or 0),
         }
         return SendDiscordWebhook("Door Opened - Farm Totals", table.concat(lines, "\n"), 16753920)
     end
@@ -8420,7 +8425,7 @@ local function PaintItemStatus()
     if Gui.DoorStatsRow and Hub.Items.Rewards then
         local r = Hub.Items.Rewards
         Gui.DoorStatsRow:SetTitle(string.format("Doors opened: %d", r.Doors or 0))
-        Gui.DoorStatsRow:SetDesc(string.format("shards %d | coupons %d | vip %d | cursed %d | pumpkins %d",
+        Gui.DoorStatsRow:SetDesc(string.format("crystals %d | coupons %d | premium %d | cursed %d | jacks %d",
             r.Shards or 0, r.Coupons or 0, r.VipCoupons or 0, r.CursedKeys or 0, r.Pumpkins or 0))
     end
     if Gui.BasketStatus then
