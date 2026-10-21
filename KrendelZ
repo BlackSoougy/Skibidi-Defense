@@ -64,11 +64,17 @@ local State = {
     DoorOffsetZ = 0,
     DoorPose = "Stand",
     DoorFaceAway = false,
-    DoorInterval = 10,
-    DoorCooldown = 1800,
+    DoorInterval = 1,
+    DoorCooldown = 60,
+    DoorTravel = true,
+    DoorTravelSpeed = 509,
+    DoorTravelDepth = 50,
+    DoorFlightY = 0,
+    DoorAnimFreeze = true,
+    DoorInstant = true,
     ClearMapAuto = true,
     PromptWalls = true,
-    PromptAnywhere = true,
+    PromptAnywhere = false,
     CrystalFarm = false,
     CrystalInterval = 5,
     CrystalCooldown = 60,
@@ -6127,6 +6133,49 @@ function Farm.SetNoclip(on)
 end
 
 --==========================================================================
+-- Мгновенные промпты
+-- HoldDuration = 0 убирает полоску удержания: InputHoldBegin и InputHoldEnd
+-- уходят в одном кадре. Это ровно та же активация, что игрок делает руками,
+-- просто без задержки - сервер разницы не видит.
+-- Фоновый проход раз в полсекунды возвращает значение, если игра его вернёт.
+--==========================================================================
+
+Farm.InstantActive = false
+
+function Farm.InstantApply()
+    for _, item in ipairs(Farm.PromptList()) do
+        local prompt = item.Prompt
+        if prompt and prompt.Parent then
+            if (prompt.HoldDuration or 0) > 0 then
+                pcall(function()
+                    prompt.HoldDuration = 0
+                end)
+            end
+            if prompt.RequiresLineOfSight then
+                pcall(function()
+                    prompt.RequiresLineOfSight = false
+                end)
+            end
+        end
+    end
+end
+
+function Farm.SetInstant(on)
+    if on then
+        Farm.InstantActive = true
+        Farm.InstantApply()
+        task.spawn(function()
+            while Farm.InstantActive do
+                Farm.InstantApply()
+                task.wait(0.5)
+            end
+        end)
+    else
+        Farm.InstantActive = false
+    end
+end
+
+--==========================================================================
 -- Промпты: дистанция обычная, но стены и игроки больше не перекрывают
 -- взаимодействие. MaxActivationDistance не трогаем - достаём ровно настолько,
 -- насколько разрешил разработчик. Трогаем только RequiresLineOfSight и сразу
@@ -6142,6 +6191,7 @@ function Farm.PromptReach(prompt)
 end
 
 function Farm.TriggerPrompt(prompt)
+    local instant = State.DoorInstant ~= false
     local previous = prompt.RequiresLineOfSight
     pcall(function()
         prompt.RequiresLineOfSight = false
@@ -6151,14 +6201,22 @@ function Farm.TriggerPrompt(prompt)
     end)
     if held then
         local hold = prompt.HoldDuration
-        if type(hold) ~= "number" or hold <= 0 then
+        if instant then
+            -- Мгновенный режим: удержание не нужно вообще, Begin и End в одном
+            -- кадре. Сервер видит ровно ту же активацию, что и от руки.
+            hold = 0
+        elseif type(hold) ~= "number" or hold <= 0 then
             hold = 0.15
         end
-        task.wait(hold + 0.05)
+        if hold > 0 then
+            task.wait(hold + 0.05)
+        end
         pcall(function()
             prompt:InputHoldEnd()
         end)
-        task.wait(0.05)
+        if not instant then
+            task.wait(0.05)
+        end
     elseif type(fireproximityprompt) == "function" then
         -- InputHoldBegin в этом исполнителе не сработал. Идём через хелпер, но
         -- только потому, что дистанцию до промпта мы уже проверили сами.
@@ -6503,7 +6561,11 @@ function Farm.TeleportToPoint(point)
     local offsetX = tonumber(State.DoorOffsetX) or 0
     local offsetY = tonumber(State.DoorOffsetY) or 0
     local offsetZ = tonumber(State.DoorOffsetZ) or 0
-    local position = Vector3.new(base.X + offsetX, base.Y + offsetY, base.Z + offsetZ)
+    local position = Vector3.new(
+        base.X + offsetX,
+        base.Y + offsetY + (tonumber(State.DoorFlightY) or 0),
+        base.Z + offsetZ
+    )
 
     -- Направление берём с камеры: куда смотришь - туда и встанешь лицом.
     local direction = Vector3.new(0, 0, -1)
@@ -6529,6 +6591,323 @@ function Farm.TeleportToPoint(point)
     return true
 end
 
+--==========================================================================
+-- Перелёт под картой вместо мгновенного телепорта
+-- Рывок видно со стороны: персонаж появляется на дороге между точками.
+-- Поэтому маршрут разбит на три отрезка:
+--   1) вниз на DoorTravelDepth студов - под карту,
+--   2) по прямой под картой, пока X и Z не совпадут с меткой,
+--   3) вверх на высоту метки, уже с поворотом к двери.
+-- Ноклип включается только на время перелёта и выключается сразу на посадке:
+-- под картой без него не пролететь, а на точке персонаж снова обычный, с
+-- коллизиями, и стоит на полу у двери.
+--==========================================================================
+
+Farm.TravelForce = false
+Farm.Traveling = false
+
+function Farm.MoveRoot(root, position, lookAt)
+    local frame
+    if lookAt then
+        frame = CFrame.lookAt(position, lookAt)
+    else
+        -- Без цели поворота держим текущий разворот, иначе тело крутит на месте.
+        frame = CFrame.new(position) * (root.CFrame - root.CFrame.Position)
+    end
+    pcall(function()
+        root.CFrame = frame
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+end
+
+-- Один отрезок маршрута: тянем рут из from в to со скоростью speed студ/сек.
+function Farm.Glide(root, from, to, speed, lookAt)
+    local distance = (to - from).Magnitude
+    if distance < 0.05 then
+        Farm.MoveRoot(root, to, lookAt)
+        return true
+    end
+    local rate = math.max(20, tonumber(speed) or 350)
+    local duration = distance / rate
+    local startedAt = os.clock()
+    while true do
+        if not Farm.DoorRunning and not Farm.TravelForce then
+            return false
+        end
+        if not root.Parent then
+            return false
+        end
+        local alpha = (os.clock() - startedAt) / duration
+        if alpha >= 1 then
+            Farm.MoveRoot(root, to, lookAt)
+            return true
+        end
+        -- Плавный старт и плавное торможение, чтобы не дёргалось на стыках.
+        local eased = alpha * alpha * (3 - 2 * alpha)
+        Farm.MoveRoot(root, from:Lerp(to, eased), lookAt)
+        task.wait()
+    end
+end
+
+function Farm.TravelToPoint(point)
+    local root = FarmRoot()
+    if not root or not point then
+        return false
+    end
+
+    local base = point.Position
+    -- Высота прилёта: смещение точки плюс отдельная поправка DoorFlightY.
+    -- Именно ей лечится «вылезание за пропы» на посадке: докручиваем Y вверх
+    -- или вниз, не трогая остальные оси.
+    local goal = Vector3.new(
+        base.X + (tonumber(State.DoorOffsetX) or 0),
+        base.Y + (tonumber(State.DoorOffsetY) or 0) + (tonumber(State.DoorFlightY) or 0),
+        base.Z + (tonumber(State.DoorOffsetZ) or 0)
+    )
+
+    local direction = Vector3.new(0, 0, -1)
+    pcall(function()
+        local camera = Workspace.CurrentCamera
+        if camera then
+            local look = camera.CFrame.LookVector
+            local flat = Vector3.new(look.X, 0, look.Z)
+            if flat.Magnitude > 0.01 then
+                direction = flat.Unit
+            end
+        end
+    end)
+    if State.DoorFaceAway then
+        direction = -direction
+    end
+
+    local pose = Farm.Poses[State.DoorPose] or Farm.Poses["Stand"]
+    local speed = math.clamp(tonumber(State.DoorTravelSpeed) or 350, 20, 4000)
+    local depth = math.clamp(tonumber(State.DoorTravelDepth) or 50, 5, 500)
+
+    local start = root.Position
+    local underY = math.min(start.Y, goal.Y) - depth
+    local underStart = Vector3.new(start.X, underY, start.Z)
+    local underGoal = Vector3.new(goal.X, underY, goal.Z)
+
+    local flat = Vector3.new(underGoal.X - underStart.X, 0, underGoal.Z - underStart.Z)
+    local travelDir = flat.Magnitude > 0.01 and flat.Unit or direction
+
+    -- Ноклип только на время перелёта: под картой без него не пролететь.
+    pcall(function()
+        Farm.SetNoclip(true)
+    end)
+
+    Farm.Traveling = true
+    local ok = Farm.Glide(root, start, underStart, speed, nil)
+    if ok then
+        ok = Farm.Glide(root, underStart, underGoal, speed, underGoal + travelDir)
+    end
+    if ok then
+        ok = Farm.Glide(root, underGoal, goal, speed, goal + direction)
+    end
+    Farm.Traveling = false
+
+    if not ok then
+        -- Полёт сорвался (стоп фарма или потерян персонаж) - ноклип не оставляем.
+        pcall(function()
+            Farm.SetNoclip(false)
+        end)
+        return false
+    end
+
+    root.CFrame = CFrame.lookAt(goal, goal + direction) * CFrame.Angles(pose.pitch, 0, pose.roll)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+
+    -- Прилетели - ноклип выключаем: персонаж снова обычный, с коллизиями,
+    -- и встаёт на пол у двери, а не висит закреплённым в воздухе.
+    pcall(function()
+        Farm.SetNoclip(false)
+    end)
+    return true
+end
+
+--==========================================================================
+-- Глушилка анимации дверей
+-- Дверь открывается на клиенте: парты внутри модели (Door, Doorframe, root)
+-- уезжают твином, гаснет прозрачность, иногда играет Animator. Сервер про
+-- это ничего не знает, поэтому достаточно не давать значениям измениться:
+-- как только парт внутри door-модели трогает CFrame или Transparency,
+-- возвращаем исходное. Дверь для нас просто стоит, промпт работает как раньше.
+--==========================================================================
+
+Farm.DoorAnim = {
+    on = false,
+    parts = {},
+    conns = {},
+    animators = {},
+    guard = {},
+    added = nil,
+    count = 0,
+}
+
+function Farm.DoorAnim.Match(instance)
+    return string.match(tostring(instance.Name), "^[Dd][Oo][Oo][Rr]%d*$") ~= nil
+end
+
+function Farm.DoorAnim.Restore(part, entry)
+    if Farm.DoorAnim.guard[part] then
+        return
+    end
+    Farm.DoorAnim.guard[part] = true
+    pcall(function()
+        if part.CFrame ~= entry.cf then
+            part.CFrame = entry.cf
+        end
+        if math.abs(part.Transparency - entry.transparency) > 0.001 then
+            part.Transparency = entry.transparency
+        end
+    end)
+    Farm.DoorAnim.guard[part] = nil
+end
+
+function Farm.DoorAnim.Hook(part)
+    if Farm.DoorAnim.parts[part] then
+        return
+    end
+    local entry = {
+        cf = part.CFrame,
+        transparency = part.Transparency,
+    }
+    Farm.DoorAnim.parts[part] = entry
+    Farm.DoorAnim.conns[#Farm.DoorAnim.conns + 1] = part:GetPropertyChangedSignal("CFrame"):Connect(function()
+        if Farm.DoorAnim.on then
+            Farm.DoorAnim.Restore(part, entry)
+        end
+    end)
+    Farm.DoorAnim.conns[#Farm.DoorAnim.conns + 1] = part:GetPropertyChangedSignal("Transparency"):Connect(function()
+        if Farm.DoorAnim.on then
+            Farm.DoorAnim.Restore(part, entry)
+        end
+    end)
+end
+
+function Farm.DoorAnim.HookAnimator(animator)
+    if Farm.DoorAnim.animators[animator] then
+        return
+    end
+    Farm.DoorAnim.animators[animator] = true
+    pcall(function()
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            track:Stop(0)
+        end
+    end)
+    Farm.DoorAnim.conns[#Farm.DoorAnim.conns + 1] = animator.AnimationPlayed:Connect(function(track)
+        if not Farm.DoorAnim.on then
+            return
+        end
+        pcall(function()
+            track:Stop(0)
+            track:Destroy()
+        end)
+    end)
+end
+
+function Farm.DoorAnim.HookJoint(joint)
+    if Farm.DoorAnim.animators[joint] then
+        return
+    end
+    Farm.DoorAnim.animators[joint] = true
+    local c0 = joint.C0
+    local c1 = joint.C1
+    Farm.DoorAnim.conns[#Farm.DoorAnim.conns + 1] = joint:GetPropertyChangedSignal("C0"):Connect(function()
+        if Farm.DoorAnim.on and joint.C0 ~= c0 then
+            pcall(function()
+                joint.C0 = c0
+            end)
+        end
+    end)
+    Farm.DoorAnim.conns[#Farm.DoorAnim.conns + 1] = joint:GetPropertyChangedSignal("C1"):Connect(function()
+        if Farm.DoorAnim.on and joint.C1 ~= c1 then
+            pcall(function()
+                joint.C1 = c1
+            end)
+        end
+    end)
+end
+
+function Farm.DoorAnim.ScanModel(model)
+    for _, item in ipairs(model:GetDescendants()) do
+        if item:IsA("BasePart") then
+            Farm.DoorAnim.Hook(item)
+        elseif item:IsA("Motor6D") or item:IsA("Weld") then
+            Farm.DoorAnim.HookJoint(item)
+        elseif item:IsA("Animator") or item:IsA("Humanoid") then
+            Farm.DoorAnim.HookAnimator(item)
+        end
+    end
+end
+
+function Farm.DoorAnim.Scan()
+    local scanned = 0
+    for _, model in ipairs(Workspace:GetDescendants()) do
+        if (model:IsA("Model") or model:IsA("Folder")) and Farm.DoorAnim.Match(model) then
+            Farm.DoorAnim.ScanModel(model)
+            scanned = scanned + 1
+        end
+    end
+    Farm.DoorAnim.count = scanned
+    return scanned
+end
+
+function Farm.DoorAnim.Start()
+    Farm.DoorAnim.on = true
+    Farm.DoorAnim.Scan()
+    if not Farm.DoorAnim.added then
+        Farm.DoorAnim.added = Workspace.DescendantAdded:Connect(function(item)
+            if not Farm.DoorAnim.on then
+                return
+            end
+            if not (item:IsA("Model") or item:IsA("Folder")) then
+                return
+            end
+            if Farm.DoorAnim.Match(item) then
+                Farm.DoorAnim.ScanModel(item)
+            end
+        end)
+    end
+    return Farm.DoorAnim.count
+end
+
+function Farm.DoorAnim.Stop()
+    Farm.DoorAnim.on = false
+    for _, conn in ipairs(Farm.DoorAnim.conns) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+    if Farm.DoorAnim.added then
+        pcall(function()
+            Farm.DoorAnim.added:Disconnect()
+        end)
+        Farm.DoorAnim.added = nil
+    end
+    Farm.DoorAnim.conns = {}
+    Farm.DoorAnim.parts = {}
+    Farm.DoorAnim.animators = {}
+    Farm.DoorAnim.guard = {}
+    Farm.DoorAnim.count = 0
+end
+
+-- Переснять текущее положение как «исходное». Нужно, если дверь успела
+-- открыться до включения глушилки и мы зафиксировали её уже сдвинутой.
+function Farm.DoorAnim.Resnap()
+    -- Правим записи на месте: замыкания держат ссылку на ту же таблицу.
+    for part, entry in pairs(Farm.DoorAnim.parts) do
+        if part.Parent then
+            entry.cf = part.CFrame
+            entry.transparency = part.Transparency
+        end
+    end
+end
+
+
 -- Держим ближайший промпт так же, как это сделал бы игрок: сначала телепорт
 -- в точку, потом нажатие. Дистанцию не подменяем - она остаётся такой, какой
 -- её написал разработчик. Не мешают только стены и игроки: промпт срабатывает
@@ -6537,6 +6916,7 @@ function Farm.InteractNear(point, radius)
     local limit = tonumber(radius) or math.huge
     local best = nil
     local bestDistance = math.huge
+    local hits = {}
     for _, item in ipairs(Farm.PromptList()) do
         local prompt = item.Prompt
         if prompt.Enabled and item.Part.Parent then
@@ -6545,15 +6925,33 @@ function Farm.InteractNear(point, radius)
             -- но и стены с игроками больше не обрезают. +1.5 студа - это
             -- компенсация округления координат в списке точек, не дальность.
             local reach = math.min(Farm.PromptReach(prompt) + 1.5, limit)
-            if distance <= reach and distance < bestDistance then
-                best = prompt
-                bestDistance = distance
+            if distance <= reach then
+                hits[#hits + 1] = prompt
+                if distance < bestDistance then
+                    best = prompt
+                    bestDistance = distance
+                end
             end
         end
     end
+
     if not best then
         return false
     end
+
+    -- Мгновенный режим: жмём не только ближайший, а все промпты в досягаемости.
+    -- На двери это обычно один-два, но если их несколько на точке, попадание
+    -- перестаёт зависеть от того, какой из них оказался первым в списке.
+    if State.DoorInstant ~= false and #hits > 1 then
+        local fired = false
+        for _, prompt in ipairs(hits) do
+            if Farm.TriggerPrompt(prompt) then
+                fired = true
+            end
+        end
+        return fired
+    end
+
     return Farm.TriggerPrompt(best)
 end
 
@@ -6568,10 +6966,25 @@ function Farm.TryPoint(point, timeout)
     Farm.DoorCooldownHit = false
     Farm.DoorCooldownHitAt = 0
 
-    if not Farm.TeleportToPoint(point) then
+    local moved
+    if State.DoorTravel ~= false then
+        moved = Farm.TravelToPoint(point)
+    else
+        moved = Farm.TeleportToPoint(point)
+    end
+    if not moved then
+        if not Farm.DoorRunning then
+            return "stopped"
+        end
         return "unreachable"
     end
-    task.wait(1.0)
+    -- В мгновенном режиме промпт срабатывает сразу, ждать полсекунды незачем:
+    -- хватает одного кадра, чтобы позиция устоялась после посадки.
+    if State.DoorInstant ~= false then
+        task.wait(0.25)
+    else
+        task.wait(0.6)
+    end
 
     if not Farm.InteractNear(point) then
         -- Ни одного промпта в обычной дистанции - точку не сжигаем, вернёмся.
@@ -7638,6 +8051,21 @@ function Farm.StartDoor()
     Farm.DoorGen = (Farm.DoorGen or 0) + 1
     Farm.DoorNextAt = 0
     Farm.DoorCursor = 1
+    -- Ноклип нужен на весь фарм: под картой иначе не пролететь, а наверху
+    -- рут закреплён, чтобы персонаж не падал сквозь пол.
+    pcall(function()
+        Farm.SetNoclip(true)
+    end)
+    pcall(function()
+        Farm.SetInstant(State.DoorInstant ~= false)
+    end)
+    -- На фарме всегда широкий обзор: 200 градусов через расширитель камеры.
+    pcall(function()
+        if Hub.Fov then
+            Hub.Fov.value = 200
+            Hub.Fov.setEnabled(true)
+        end
+    end)
     FarmReportFor("door", "door farm running")
     local gen = Farm.DoorGen
     task.spawn(function()
@@ -7650,6 +8078,18 @@ function Farm.StopDoor()
     -- Bumping the generation kills every loop that is still inside a task.wait,
     -- including duplicates left behind by an earlier injection.
     Farm.DoorGen = (Farm.DoorGen or 0) + 1
+    pcall(function()
+        Farm.SetNoclip(false)
+    end)
+    pcall(function()
+        Farm.SetInstant(false)
+    end)
+    -- Фарм выключили - возвращаем камере её обычный угол.
+    pcall(function()
+        if Hub.Fov then
+            Hub.Fov.reset()
+        end
+    end)
     FarmReportFor("door", "door farm stopped")
 end
 
@@ -9278,6 +9718,24 @@ State.FullbrightNoAtmosphere = Config.FullbrightNoAtmosphere ~= false
 State.FullbrightNoPost = Config.FullbrightNoPost ~= false
 State.FovEnabled = Config.FovEnabled == true
 State.FovValue = math.clamp(tonumber(Config.FovValue) or 70, 1, 200)
+-- Дверной фарм зафиксирован: виджеты убраны, значения не читаются из конфига,
+-- иначе старый сохранённый конфиг вернул бы прежние настройки.
+State.DoorTravel = true
+State.DoorTravelSpeed = 509
+State.DoorTravelDepth = 50
+State.DoorFlightY = 0
+State.DoorAnimFreeze = true
+State.DoorInstant = true
+State.DoorFaceAway = false
+State.DoorPose = "Stand"
+State.DoorOffsetX = 0
+State.DoorOffsetY = 2
+State.DoorOffsetZ = 0
+State.DoorInterval = 1
+State.DoorCooldown = 60
+State.PromptWalls = true
+State.ClearMapAuto = true
+State.PromptAnywhere = false
 State.FpsCap = math.max(0, math.floor(tonumber(Config.FpsCap) or 240))
 if State.FpsCap > 0 and State.FpsCap < 5 then
     State.FpsCap = 5
@@ -10043,22 +10501,25 @@ DoorBox:AddDropdown("Teleport Pose", {
     State.DoorPose = tostring(value)
     QueueSave()
 end)
-DoorBox:AddToggle("Face Away From Door", "Flips the character 180 degrees - which side faces the door", State.DoorFaceAway == true, function(value)
-    State.DoorFaceAway = value == true
-    QueueSave()
+-- Всё, что раньше крутилось тумблерами и ползунками, зафиксировано:
+-- перелёт под картой, скорость 509 студ/с, глубина 50, высота прилёта 0,
+-- смещения 0/2/0, поза Stand, мгновенные промпты, заморозка анимации дверей.
+-- Настройки убраны из меню, чтобы рабочий режим нельзя было сбить случайно.
+DoorBox:AddActionRow("Rescan Doors", "Re-captures the current door positions as the frozen state", StarHubUI.Icons.Refresh, function()
+    if not Farm.DoorAnim.on then
+        Farm.DoorAnim.Start()
+    else
+        Farm.DoorAnim.Scan()
+        Farm.DoorAnim.Resnap()
+    end
+    Notify("Door Animation", tostring(Farm.DoorAnim.count) .. " door models tracked")
 end)
-DoorBox:AddSlider("Teleport Offset X", -20, 20, State.DoorOffsetX or 0, "ST", function(value)
-    State.DoorOffsetX = math.clamp(math.floor((tonumber(value) or 0) + 0.5), -20, 20)
-    QueueSave()
-end)
-DoorBox:AddSlider("Teleport Offset Y", -10, 30, State.DoorOffsetY or 2, "ST", function(value)
-    State.DoorOffsetY = math.clamp(math.floor((tonumber(value) or 0) + 0.5), -10, 30)
-    QueueSave()
-end)
-DoorBox:AddSlider("Teleport Offset Z", -20, 20, State.DoorOffsetZ or 0, "ST", function(value)
-    State.DoorOffsetZ = math.clamp(math.floor((tonumber(value) or 0) + 0.5), -20, 20)
-    QueueSave()
-end)
+
+if State.DoorAnimFreeze ~= false then
+    task.defer(function()
+        Farm.DoorAnim.Start()
+    end)
+end
 DoorBox:AddActionRow("Test Teleport", "Jumps to the current point with these offsets and pose", StarHubUI.Icons.Teleport, function()
     local points = Farm.CollectPoints()
     if #points == 0 then
@@ -10068,20 +10529,24 @@ DoorBox:AddActionRow("Test Teleport", "Jumps to the current point with these off
     local index = math.clamp(tonumber(Farm.DoorCursor) or 1, 1, #points)
     local chosen = points[index]
 
-    if Farm.TeleportToPoint(chosen) then
+    local moved
+    if State.DoorTravel ~= false then
+        -- Полный маршрут с ноклипом, как в фарме, только без запуска цикла.
+        Farm.SetNoclip(true)
+        Farm.TravelForce = true
+        moved = Farm.TravelToPoint(chosen)
+        Farm.TravelForce = false
+        Farm.SetNoclip(false)
+    else
+        moved = Farm.TeleportToPoint(chosen)
+    end
+
+    if moved then
         Notify("Door Farm", tostring(chosen.Name) .. " | " .. tostring(State.DoorPose)
             .. " | " .. tostring(State.DoorOffsetX) .. "/" .. tostring(State.DoorOffsetY) .. "/" .. tostring(State.DoorOffsetZ))
     else
         Notify("Door Farm", "could not teleport")
     end
-end)
-DoorBox:AddSlider("Interval Between Doors", 1, 60, State.DoorInterval, "SEC", function(value)
-    State.DoorInterval = math.clamp(math.floor((tonumber(value) or 10) + 0.5), 1, 60)
-    QueueSave()
-end)
-DoorBox:AddSlider("Door Cooldown", 1, 60, math.floor(State.DoorCooldown / 60 + 0.5), "MIN", function(value)
-    State.DoorCooldown = math.clamp(math.floor((tonumber(value) or 30) + 0.5), 1, 60) * 60
-    QueueSave()
 end)
 Gui.DoorFarmStatus = MakeInfoRow(DoorBox, "Points: 0", "Idle", StarHubUI.Icons.Teleport)
 DoorBox:AddActionRow("Scan Points", "Lists exactly which coordinates the farm will use", StarHubUI.Icons.Search, function()
@@ -10100,23 +10565,6 @@ end)
 DoorBox:AddActionRow("Show Door Status", "Prints how many points were found", StarHubUI.Icons.Dashboard, function()
     Notify("Door Farm", tostring(Farm.Message) .. " | points: " .. tostring(Farm.DoorCount))
 end)
-DoorBox:AddToggle("Prompts Through Walls", "Proximity prompts work through walls and players - distance stays normal", State.PromptWalls ~= false, function(value)
-    State.PromptWalls = value == true
-    if State.PromptWalls then
-        Farm.StartPromptPatch()
-    else
-        Farm.StopPromptPatch()
-    end
-    QueueSave()
-end)
-DoorBox:AddToggle("Auto Clear Map", "Deletes only the 168 recorded objects, right after inject", State.ClearMapAuto ~= false, function(value)
-    State.ClearMapAuto = value == true
-    Farm.ClearAuto = State.ClearMapAuto
-    if State.ClearMapAuto then
-        Farm.ClearAutoRun()
-    end
-    QueueSave()
-end)
 Gui.ClearStatus = MakeInfoRow(DoorBox, "Clear map: not run", "168 objects from the log", StarHubUI.Icons.Skull)
 DoorBox:AddActionRow("Clear Map Once", "Deletes only the 168 recorded objects - nothing else", StarHubUI.Icons.Skull, function()
     local removed = Farm.ClearOnce()
@@ -10130,15 +10578,6 @@ end)
 DoorBox:AddActionRow("Patch Prompts Now", "Sets RequiresLineOfSight = false on every prompt right now", StarHubUI.Icons.Search, function()
     local count = Farm.PatchPrompts()
     Notify("Prompts", tostring(count) .. " prompts patched")
-end)
-DoorBox:AddToggle("Prompts Off-Screen", "The prompt key works even when the switch is behind you or off the screen", State.PromptAnywhere ~= false, function(value)
-    State.PromptAnywhere = value == true
-    if State.PromptAnywhere then
-        Farm.StartPromptAnywhere()
-    else
-        Farm.StopPromptAnywhere()
-    end
-    QueueSave()
 end)
 DoorBox:AddActionRow("Fire Nearest Prompt", "Triggers the closest prompt in range, camera ignored", StarHubUI.Icons.Zap, function()
     local fired = Farm.FireNearestPrompt()
@@ -11417,10 +11856,8 @@ if State.PromptWalls ~= false then
     Farm.StartPromptPatch()
 end
 
--- Промпты вне экрана: клавиша срабатывает, даже если кнопка не в кадре.
-if State.PromptAnywhere ~= false then
-    Farm.StartPromptAnywhere()
-end
+-- Промпты вне экрана больше не включаются: клиент не даёт жать промпт,
+-- который сам не показал, так что режим был бесполезен.
 
 Farm.ClearAuto = State.ClearMapAuto ~= false
 if Farm.ClearAuto then
