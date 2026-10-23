@@ -105,6 +105,16 @@ local State = {
     PumpkinByRoute = true,
     PumpkinRoutePasses = 2,
     Basket = false,
+    CrateAuto = false,
+    CrateCursed = true,
+    CrateDiamond = false,
+    CrateInterval = 5,
+    CrateAmount = 3,
+    CrateDiamondName = "MegaDiamond",
+    CrateTopOnly = true,
+    CrateAutoRefresh = true,
+    CrateRefreshSeconds = 10,
+    SkipBattlePass = false,
 }
 
 local MacroFolder = "SkibidiDefense_Macros"
@@ -8607,6 +8617,933 @@ do
 end
 
 
+-- Crates + stock reader --------------------------------------------------------
+-- The crate buttons and the stock cards are discovered at runtime instead of
+-- being hardcoded: the shop rebuilds its frames on every open and the hierarchy
+-- names shift between game updates. Everything here is pcall-guarded because the
+-- shop is rebuilt while we are walking it.
+do
+    local Crates = {
+        Status = "idle",
+        StockStatus = "idle",
+        Stock = {},
+        StockUpdatedAt = 0,
+        Opens = 0,
+        AutoRunning = false,
+        AutoToken = 0,
+        AutoRefresh = false,
+        AutoRefreshToken = 0,
+        NextAutoAt = 0,
+        LastKind = "cursed",
+        LastClickMethod = "none",
+        Confirm = { "open", "unlock", "открыть" },
+        RarityOrder = {
+            "secret", "extraordinary", "celestial", "divine", "godly", "mythic",
+            "legendary", "exclusive", "ancient", "epic", "rare", "uncommon", "common",
+        },
+        Listener = nil,
+    }
+
+    local VimService = nil
+
+    local function Report(text)
+        Crates.Status = tostring(text)
+        if type(Crates.Listener) == "function" then
+            pcall(Crates.Listener, Crates.Status)
+        end
+    end
+
+    local function PlayerGuiOf()
+        local player = Players.LocalPlayer
+        if not player then
+            return nil
+        end
+        return player:FindFirstChild("PlayerGui")
+    end
+
+    local function ReadText(obj)
+        if not obj then
+            return nil
+        end
+        local ok, value = pcall(function()
+            return obj.Text
+        end)
+        if ok and type(value) == "string" and value ~= "" then
+            return value
+        end
+        return nil
+    end
+
+    -- Name + first few label texts, lowercased, used for keyword matching.
+    local function Blob(obj, limit)
+        local parts = { string.lower(tostring(obj.Name)) }
+        local count = 0
+        for _, child in ipairs(obj:GetDescendants()) do
+            if child:IsA("TextLabel") or child:IsA("TextButton") or child:IsA("TextBox") then
+                local text = ReadText(child)
+                if text then
+                    table.insert(parts, string.lower(text))
+                    count = count + 1
+                    if count >= (limit or 6) then
+                        break
+                    end
+                end
+            end
+        end
+        return table.concat(parts, " ")
+    end
+
+    local function Clickable(obj)
+        if not obj then
+            return false
+        end
+        local ok, isButton = pcall(function()
+            return obj:IsA("GuiButton")
+        end)
+        if not ok or not isButton then
+            return false
+        end
+        local okSize, usable = pcall(function()
+            return obj.Visible and obj.AbsoluteSize.X > 0 and obj.AbsoluteSize.Y > 0
+        end)
+        return okSize and usable
+    end
+
+    -- Existing connections first (they prove the handler exists), then
+    -- firesignal, then a synthetic mouse click at the button centre.
+    function Crates.Click(button)
+        if not button then
+            return false, "no button"
+        end
+        if type(getconnections) == "function" then
+            local ok, connections = pcall(getconnections, button.MouseButton1Click)
+            if ok and type(connections) == "table" and #connections > 0 then
+                local fired = 0
+                for _, connection in ipairs(connections) do
+                    local done = pcall(function()
+                        connection:Fire()
+                    end)
+                    if done then
+                        fired = fired + 1
+                    end
+                end
+                if fired > 0 then
+                    Crates.LastClickMethod = "connection"
+                    return true, Crates.LastClickMethod
+                end
+            end
+        end
+        if type(firesignal) == "function" then
+            local ok = pcall(firesignal, button.MouseButton1Click)
+            if ok then
+                Crates.LastClickMethod = "firesignal"
+                return true, Crates.LastClickMethod
+            end
+        end
+        if not VimService then
+            local ok, service = pcall(function()
+                return game:GetService("VirtualInputManager")
+            end)
+            if ok then
+                VimService = service
+            end
+        end
+        if VimService then
+            local ok = pcall(function()
+                local position = button.AbsolutePosition
+                local size = button.AbsoluteSize
+                local x = position.X + size.X / 2
+                local y = position.Y + size.Y / 2
+                pcall(function()
+                    VimService:SendMouseMoveEvent(x, y, game)
+                end)
+                VimService:SendMouseButtonEvent(x, y, 0, true, game, 1)
+                task.wait(0.02)
+                VimService:SendMouseButtonEvent(x, y, 0, false, game, 1)
+            end)
+            if ok then
+                Crates.LastClickMethod = "virtual"
+                return true, Crates.LastClickMethod
+            end
+        end
+        return false, "no click method"
+    end
+
+    function Crates.FindButton(kind)
+        local root = PlayerGuiOf()
+        if not root then
+            return nil, 0
+        end
+        local needle = string.lower(tostring(kind))
+        local best, bestScore = nil, 0
+        for _, obj in ipairs(root:GetDescendants()) do
+            if Clickable(obj) then
+                local blob = Blob(obj)
+                if string.find(blob, needle, 1, true) then
+                    local score = 1
+                    if string.find(string.lower(tostring(obj.Name)), needle, 1, true) then
+                        score = score + 4
+                    end
+                    if string.find(blob, "crate", 1, true) then
+                        score = score + 3
+                    end
+                    if string.find(blob, "open", 1, true) or string.find(blob, "unlock", 1, true) then
+                        score = score + 2
+                    end
+                    if score > bestScore then
+                        best, bestScore = obj, score
+                    end
+                end
+            end
+        end
+        return best, bestScore
+    end
+
+    -- The panel that pops up after the crate is picked usually carries its own
+    -- Open / Unlock button; skip the crate button we just pressed. A button that
+    -- names the other crate, or that lives outside a panel mentioning this one,
+    -- is never clicked - a wrong "Open" is worse than no confirm at all.
+    function Crates.FindConfirm(kind, exclude)
+        local root = PlayerGuiOf()
+        if not root then
+            return nil
+        end
+        local needle = string.lower(tostring(kind))
+        local other = (needle == "cursed") and "diamond" or "cursed"
+        local best, bestScore = nil, 0
+        local generic, genericCount = nil, 0
+        for _, obj in ipairs(root:GetDescendants()) do
+            if obj ~= exclude and Clickable(obj) then
+                local blob = Blob(obj)
+                local wanted = false
+                for _, word in ipairs(Crates.Confirm) do
+                    if string.find(blob, word, 1, true) then
+                        wanted = true
+                        break
+                    end
+                end
+                if wanted and not string.find(blob, other, 1, true) then
+                    local score = 0
+                    if string.find(blob, needle, 1, true) then
+                        score = 6
+                    end
+                    local node = obj.Parent
+                    local depth = 0
+                    while node and node ~= root and depth < 5 do
+                        if string.find(string.lower(tostring(node.Name)), needle, 1, true) then
+                            score = score + 4
+                            break
+                        end
+                        depth = depth + 1
+                        node = node.Parent
+                    end
+                    if score > bestScore then
+                        best, bestScore = obj, score
+                    end
+                    if score == 0 then
+                        genericCount = genericCount + 1
+                        generic = obj
+                    end
+                end
+            end
+        end
+        if best then
+            return best
+        end
+        -- No crate-specific panel: accept a single unambiguous Open button.
+        if genericCount == 1 then
+            return generic
+        end
+        return nil
+    end
+
+    -- Real crate names as the server expects them. The captured call was
+    -- ReplicatedStorage.NotGambling:FireServer(3, "Golden") - only the second
+    -- argument changes between crates, the first one is the amount.
+    -- The side buttons are named Cursed / MegaDiamond, so the ids follow them.
+    Crates.Names = {
+        cursed = "Cursed",
+        diamond = "MegaDiamond",
+        megadiamond = "MegaDiamond",
+        mega = "MegaDiamond",
+        golden = "Golden",
+    }
+
+    -- Side buttons that switch which crate the shared stock panel shows.
+    Crates.ButtonPath = {
+        cursed = "PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Side.Boxes.Cursed",
+        diamond = "PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Side.Boxes.MegaDiamond",
+        golden = "PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Side.Boxes.Golden",
+    }
+
+    -- Dotted path from the Explorer, with or without PlayerGui in front.
+    function Crates.Resolve(path)
+        local gui = PlayerGuiOf()
+        if not gui then
+            return nil
+        end
+        local node = gui
+        local ok = pcall(function()
+            for part in string.gmatch(tostring(path), "[^%.]+") do
+                if node and string.lower(part) ~= "playergui" then
+                    node = node:FindFirstChild(part)
+                end
+            end
+        end)
+        if ok and node then
+            return node
+        end
+        return nil
+    end
+
+    -- Switches the shared panel to that crate. Needed because the stock panel
+    -- keeps showing the previous crate until its side button is pressed.
+    function Crates.Select(kind)
+        kind = string.lower(tostring(kind or ""))
+        local path = Crates.ButtonPath[kind]
+        if not path then
+            return false, "unknown crate: " .. kind
+        end
+        local button = Crates.Resolve(path)
+        if not button then
+            return false, "crate button not found - open the crate shop"
+        end
+        local ok, how = Crates.Click(button)
+        if not ok then
+            return false, "click failed: " .. tostring(how)
+        end
+        return true, kind
+    end
+
+    function Crates.SelectAndScan(kind)
+        local ok, message = Crates.Select(kind)
+        if not ok then
+            Report(tostring(message))
+            return false, tostring(message)
+        end
+        task.wait(0.45)
+        pcall(Crates.ScanStock)
+        Report(string.format("showing %s | %d cards", tostring(kind), #(Crates.Stock or {})))
+        return true, Crates.Status
+    end
+
+    function Crates.Remote()
+        local ok, remote = pcall(function()
+            return ReplicatedStorage:FindFirstChild("NotGambling", true)
+        end)
+        if ok and remote then
+            local okFire, hasFire = pcall(function()
+                return remote.FireServer
+            end)
+            if okFire and hasFire then
+                return remote
+            end
+        end
+        return nil
+    end
+
+    function Crates.Fire(kind, count)
+        local remote = Crates.Remote()
+        if not remote then
+            return false, "NotGambling remote not found"
+        end
+        local name = Crates.Names[string.lower(tostring(kind))] or tostring(kind)
+        local amount = math.clamp(math.floor(tonumber(count) or 3), 1, 100)
+        local ok, err = pcall(function()
+            remote:FireServer(amount, name)
+        end)
+        if not ok then
+            return false, tostring(err)
+        end
+        return true, name, amount
+    end
+
+    function Crates.Open(kind)
+        kind = string.lower(tostring(kind or "cursed"))
+        Crates.LastKind = kind
+
+        local fired, name, amount = Crates.Fire(kind, State.CrateAmount)
+        if fired then
+            Crates.Opens = Crates.Opens + 1
+            Crates.LastClickMethod = "remote"
+            Report(string.format("NotGambling(%d, %q) #%d", amount, name, Crates.Opens))
+            return true, Crates.Status
+        end
+
+        -- Fallback only: if the remote ever gets renamed, click the GUI instead.
+        local button = Crates.Resolve(Crates.ButtonPath[kind] or "") or Crates.FindButton(kind)
+        if not button then
+            Report(tostring(name) .. " | no remote, no crate button on screen")
+            return false, Crates.Status
+        end
+        local clicked, how = Crates.Click(button)
+        if not clicked then
+            Report("click failed: " .. tostring(how))
+            return false, Crates.Status
+        end
+        task.wait(0.35)
+        local confirm = Crates.FindConfirm(kind, button)
+        if confirm then
+            Crates.Click(confirm)
+            task.wait(0.15)
+        end
+        Crates.Opens = Crates.Opens + 1
+        Report(string.format("clicked %s #%d (remote missing)", kind, Crates.Opens))
+        return true, Crates.Status
+    end
+
+    function Crates.Kinds()
+        local kinds = {}
+        if State.CrateCursed then
+            table.insert(kinds, "cursed")
+        end
+        if State.CrateDiamond then
+            table.insert(kinds, "diamond")
+        end
+        return kinds
+    end
+
+    function Crates.SetAuto(enabled)
+        Crates.AutoRunning = enabled == true
+        Crates.AutoToken = Crates.AutoToken + 1
+        if not Crates.AutoRunning then
+            Crates.NextAutoAt = 0
+            Report("auto off")
+            return
+        end
+        local token = Crates.AutoToken
+        Report("auto on")
+        task.spawn(function()
+            while Crates.AutoRunning and Crates.AutoToken == token do
+                local kinds = Crates.Kinds()
+                if #kinds == 0 then
+                    Report("auto on - no crate ticked")
+                    task.wait(1)
+                else
+                    for _, kind in ipairs(kinds) do
+                        if not Crates.AutoRunning or Crates.AutoToken ~= token then
+                            break
+                        end
+                        pcall(Crates.Open, kind)
+                        task.wait(0.5)
+                    end
+                    local delay = math.clamp(tonumber(State.CrateInterval) or 5, 1, 120)
+                    Crates.NextAutoAt = tick() + delay
+                    local spent = 0
+                    while Crates.AutoRunning and Crates.AutoToken == token and spent < delay do
+                        task.wait(0.2)
+                        spent = spent + 0.2
+                    end
+                    Crates.NextAutoAt = 0
+                end
+            end
+        end)
+    end
+
+    local function RarityOf(text)
+        if type(text) ~= "string" or text == "" then
+            return nil
+        end
+        local lower = string.lower(text)
+        for _, word in ipairs(Crates.RarityOrder) do
+            if string.find(lower, word, 1, true) then
+                return word
+            end
+        end
+        return nil
+    end
+
+    local function RarityRank(word)
+        for index, value in ipairs(Crates.RarityOrder) do
+            if value == word then
+                return index
+            end
+        end
+        return #Crates.RarityOrder + 1
+    end
+
+    -- Item is a TextLabel in the current build, but it was a Frame with a Text
+    -- child before - read the label directly, then fall back to its descendants.
+    local function DeepText(obj)
+        if not obj then
+            return nil
+        end
+        local direct = ReadText(obj)
+        if direct then
+            return direct
+        end
+        for _, child in ipairs(obj:GetDescendants()) do
+            if child:IsA("TextLabel") then
+                local text = ReadText(child)
+                if text then
+                    return text
+                end
+            end
+        end
+        return nil
+    end
+
+    local CrateWords = { "diamond", "cursed", "golden" }
+
+    -- The stock panel is a single shared frame whose contents are swapped when a
+    -- different crate is picked, so there is no per-crate tree to walk. Real path
+    -- from the Explorer:
+    --   Main.Frame.Layout.ShardGamba.Frame.Grid.Roll.<Rarity>.Item
+    --   Main.Frame.Layout.ShardGamba.Frame.Grid.Roll.Best.<Rarity>.Item
+    Crates.DefaultPath = "PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Grid.Roll"
+
+    -- Which crate a card belongs to: the nearest ancestor whose name mentions it.
+    -- The scan root itself counts, so a path ending in "...DiamondStock" tags
+    -- everything below it as diamond.
+    local function CrateOf(obj, root)
+        local node = obj
+        local depth = 0
+        while node and depth < 12 do
+            local lower = string.lower(tostring(node.Name))
+            for _, word in ipairs(CrateWords) do
+                if string.find(lower, word, 1, true) then
+                    return word
+                end
+            end
+            if node == root then
+                break
+            end
+            depth = depth + 1
+            node = node.Parent
+        end
+        return "unknown"
+    end
+
+    -- Two passes: first "Golden Crate" / "Crate: Diamond" / a bare "Golden", then
+    -- any mention at all. The strict pass exists because unit names can contain a
+    -- crate word ("Golden Speaker") and must not decide the label.
+    local function ScanForCrateWord(node, budget)
+        local texts = {}
+        local seen = 0
+        pcall(function()
+            for _, obj in ipairs(node:GetDescendants()) do
+                seen = seen + 1
+                if seen > budget then
+                    break
+                end
+                if obj:IsA("TextLabel") then
+                    local text = ReadText(obj)
+                    if text then
+                        table.insert(texts, text)
+                    end
+                end
+            end
+        end)
+        for _, text in ipairs(texts) do
+            local lower = string.lower(text)
+            for _, word in ipairs(CrateWords) do
+                if lower == word
+                    or string.find(lower, word .. " crate", 1, true)
+                    or string.find(lower, "crate " .. word, 1, true)
+                    or string.find(lower, "crate: " .. word, 1, true) then
+                    return word
+                end
+            end
+        end
+        for _, text in ipairs(texts) do
+            local lower = string.lower(text)
+            for _, word in ipairs(CrateWords) do
+                if string.find(lower, word, 1, true) then
+                    return word
+                end
+            end
+        end
+        return nil
+    end
+
+    -- The panel itself usually says which crate is selected. Look inside the roll
+    -- list first, then in its grandparent (ShardGamba.Frame).
+    function Crates.DetectCrate(root)
+        local found = ScanForCrateWord(root, 400)
+        if found then
+            return found
+        end
+        local scope = root.Parent and root.Parent.Parent
+        if scope then
+            found = ScanForCrateWord(scope, 4000)
+        end
+        return found or "unknown"
+    end
+
+    -- Fixed path, no UI knob: Main.Frame.Layout.ShardGamba.Frame.Grid.Roll.
+    -- Falls back to the whole PlayerGui if the game ever renames the frame.
+    function Crates.ScanRoot()
+        local gui = PlayerGuiOf()
+        if not gui then
+            return nil, "PlayerGui not found"
+        end
+        local node = Crates.Resolve(Crates.DefaultPath)
+        if node then
+            return node, Crates.DefaultPath
+        end
+        return gui, "whole PlayerGui"
+    end
+
+    -- Stock layout, straight from the Explorer:
+    --   Secret            <- GuiObject, the rarity is in its NAME
+    --     UICorner / UIGradient / UIStroke / Morestroke
+    --     Icon
+    --     Chance          <- TextLabel, drop chance
+    --     Item            <- TextLabel, the unit name
+    --     Pity            <- TextLabel
+    -- Older layouts put the name one level deeper (Item -> Text), so both read.
+    function Crates.ScanStock()
+        local list, seen = {}, {}
+        local root, rootLabel = Crates.ScanRoot()
+        if not root then
+            Crates.Stock = {}
+            Crates.StockStatus = tostring(rootLabel)
+            Crates.StockUpdatedAt = tick()
+            return list
+        end
+
+        -- One label for the whole scan: the panel is shared, so every card on
+        -- screen belongs to whichever crate is selected right now.
+        local crateLabel = Crates.DetectCrate(root)
+        Crates.DetectedCrate = crateLabel
+
+        local function push(unitName, rarity, crate, chance, pity)
+            if type(unitName) ~= "string" or unitName == "" then
+                return
+            end
+            local key = string.lower(unitName) .. "|" .. tostring(rarity) .. "|" .. tostring(crate)
+            if seen[key] then
+                return
+            end
+            seen[key] = true
+            table.insert(list, {
+                Name = unitName,
+                Rarity = rarity or "unknown",
+                Rank = RarityRank(rarity),
+                Crate = crate or "unknown",
+                Chance = chance,
+                Pity = pity,
+            })
+        end
+
+        for _, obj in ipairs(root:GetDescendants()) do
+            local okGui, isGui = pcall(function()
+                return obj:IsA("GuiObject")
+            end)
+            if okGui and isGui then
+                -- Layout A: the card is named after the rarity and holds Item/Chance/Pity.
+                -- The name does not have to be in RarityOrder: a frame with an Item
+                -- label plus Chance/Pity is a stock card no matter what tier it is,
+                -- so a rarity added by a future update still gets listed.
+                local itemLabel = obj:FindFirstChild("Item")
+                local chanceLabel = obj:FindFirstChild("Chance")
+                local pityLabel = obj:FindFirstChild("Pity")
+                if itemLabel and (RarityOf(obj.Name) or chanceLabel or pityLabel) then
+                    local unitName = DeepText(itemLabel)
+                    if unitName then
+                        local cardRarity = RarityOf(obj.Name) or string.lower(tostring(obj.Name))
+                        local crate = crateLabel
+                        if crate == "unknown" then
+                            crate = CrateOf(obj, root)
+                        end
+                        push(unitName, cardRarity, crate,
+                            ReadText(chanceLabel),
+                            ReadText(pityLabel))
+                    end
+                end
+
+                -- Layout B: the card itself is named Item; the rarity sits around it.
+                if string.lower(tostring(obj.Name)) == "item" then
+                    local unitName = DeepText(obj)
+                    if unitName then
+                        local rarity = nil
+                        local node = obj.Parent
+                        local depth = 0
+                        while node and node ~= root and depth < 3 and not rarity do
+                            rarity = RarityOf(node.Name)
+                            if not rarity then
+                                for _, sibling in ipairs(node:GetChildren()) do
+                                    if sibling:IsA("TextLabel") then
+                                        rarity = RarityOf(ReadText(sibling))
+                                        if rarity then
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                            depth = depth + 1
+                            node = node.Parent
+                        end
+                        local holder = obj.Parent
+                        -- Only when a known rarity was found: otherwise layout A has
+                        -- already listed this card and a second "unknown" copy would
+                        -- just show up as a duplicate line.
+                        if rarity then
+                            local crate = crateLabel
+                            if crate == "unknown" then
+                                crate = CrateOf(obj, root)
+                            end
+                            push(unitName, rarity, crate,
+                                holder and ReadText(holder:FindFirstChild("Chance")) or nil,
+                                holder and ReadText(holder:FindFirstChild("Pity")) or nil)
+                        end
+                    end
+                end
+            end
+        end
+
+        table.sort(list, function(a, b)
+            if a.Rank ~= b.Rank then
+                return a.Rank < b.Rank
+            end
+            return string.lower(a.Name) < string.lower(b.Name)
+        end)
+
+        Crates.Stock = list
+        Crates.StockUpdatedAt = tick()
+        Crates.StockSource = tostring(rootLabel)
+        if #list == 0 then
+            Crates.StockStatus = "0 cards - open the crate shop first"
+        else
+            local hidden = 0
+            local floor = RarityRank("legendary")
+            local topOnly = State.CrateTopOnly ~= false
+            for _, entry in ipairs(list) do
+                if topOnly and entry.Rank > floor then
+                    hidden = hidden + 1
+                end
+            end
+            Crates.StockStatus = string.format("%d cards%s", #list,
+                hidden > 0 and string.format(" | %d hidden", hidden) or "")
+        end
+        if type(Crates.Listener) == "function" then
+            pcall(Crates.Listener, Crates.Status)
+        end
+        return list
+    end
+
+    -- Legendary..Secret view. The panel is shared between crates, so the list is
+    -- always "whatever the selected crate shows right now".
+    function Crates.StockLines(limit)
+        local lines = {}
+        local topOnly = State.CrateTopOnly ~= false
+        local floor = RarityRank("legendary")
+        for _, entry in ipairs(Crates.Stock) do
+            local show = true
+            if topOnly then
+                show = entry.Rank <= floor
+            end
+            if show then
+                local label = string.upper(string.sub(entry.Rarity, 1, 1)) .. string.sub(entry.Rarity, 2)
+                local extra = ""
+                if entry.Chance and entry.Chance ~= "" then
+                    extra = "  (" .. entry.Chance .. ")"
+                end
+                table.insert(lines, label .. " - " .. entry.Name .. extra)
+                if limit and #lines >= limit then
+                    break
+                end
+            end
+        end
+        if #lines == 0 then
+            if #Crates.Stock == 0 then
+                return "nothing found - open the crate shop, then press Scan Stock"
+            end
+            return "nothing in stock"
+        end
+        return table.concat(lines, "\n")
+    end
+
+    function Crates.SetAutoRefresh(enabled)
+        Crates.AutoRefresh = enabled == true
+        Crates.AutoRefreshToken = Crates.AutoRefreshToken + 1
+        if not Crates.AutoRefresh then
+            return
+        end
+        local token = Crates.AutoRefreshToken
+        task.spawn(function()
+            while Crates.AutoRefresh and Crates.AutoRefreshToken == token do
+                pcall(Crates.ScanStock)
+                task.wait(math.clamp(tonumber(State.CrateRefreshSeconds) or 10, 3, 120))
+            end
+        end)
+    end
+
+    -- Writes every text node of PlayerGui to a file and the clipboard. Used to
+    -- map the real shop hierarchy when the generic scan misses something.
+    function Crates.DumpStock()
+        local root = PlayerGuiOf()
+        if not root then
+            return "PlayerGui not found"
+        end
+        local lines = { "# PlayerGui text dump " .. os.date("%Y-%m-%d %H:%M:%S") }
+        for _, obj in ipairs(root:GetDescendants()) do
+            local text = ReadText(obj)
+            if text then
+                local parts = {}
+                local node = obj.Parent
+                while node and node ~= root and #parts < 4 do
+                    table.insert(parts, 1, node.Name)
+                    node = node.Parent
+                end
+                table.insert(lines, string.format("%s.%s = %q",
+                    table.concat(parts, "."), obj.Name, text))
+            end
+        end
+        local body = table.concat(lines, "\n")
+        if type(writefile) == "function" then
+            pcall(writefile, "SkibidiDefense_GuiDump.txt", body)
+        end
+        if type(setclipboard) == "function" then
+            pcall(setclipboard, body)
+        end
+        return string.format("%d text nodes saved + copied", #lines - 1)
+    end
+
+    Hub.Crates = Crates
+end
+
+
+-- Auto skip --------------------------------------------------------------------
+-- The reward / battle pass / quest screens all expose a button whose name starts
+-- with "Skip". Paths from the Explorer:
+--   BattlePass.Skip1 / Skip5 / Skip10
+--   LootboxReward.Skip, ShardReward.Skip
+--   Main.Frame.Layout.Daily.Skip
+--   Main.Frame.Layout.QuestsRevamp.Alpha.Quests.Quests.<n>.Skip
+--   Quests.Frame.Quest.QuestBG.SkipQuest
+-- They are found by name every tick, so a rebuilt screen is picked up again.
+do
+    local Skip = {
+        Enabled = false,
+        IncludeBattlePass = false,
+        Status = "off",
+        Clicks = 0,
+        LastPath = "",
+        LastAt = 0,
+        Token = 0,
+        Listener = nil,
+        Seen = setmetatable({}, { __mode = "k" }),
+        Cadence = 0.05,
+        Cooldown = 0.2,
+    }
+
+    local function Report(text)
+        Skip.Status = tostring(text)
+        if type(Skip.Listener) == "function" then
+            pcall(Skip.Listener, Skip.Status)
+        end
+    end
+
+    -- Skip1 / Skip5 / Skip10 live in the battle pass and may spend currency, so
+    -- they stay opt-in. Everything else starting with "skip" is fair game.
+    function Skip.Matches(name)
+        if type(name) ~= "string" or name == "" then
+            return false
+        end
+        local lower = string.lower(name)
+        if string.find(lower, "skip", 1, true) ~= 1 then
+            return false
+        end
+        if string.match(lower, "^skip%d+$") then
+            return Skip.IncludeBattlePass
+        end
+        return true
+    end
+
+    -- Only visible branches are walked: most of PlayerGui is hidden panels, and
+    -- pruning them is what keeps a 20x/second scan cheap.
+    local function Collect(node, found, depth)
+        if depth > 14 then
+            return
+        end
+        for _, child in ipairs(node:GetChildren()) do
+            if child:IsA("GuiObject") then
+                if child.Visible then
+                    if child:IsA("GuiButton") and Skip.Matches(child.Name) then
+                        table.insert(found, child)
+                    end
+                    Collect(child, found, depth + 1)
+                end
+            else
+                Collect(child, found, depth + 1)
+            end
+        end
+    end
+
+    function Skip.Find()
+        local root = Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("PlayerGui")
+        local found = {}
+        if root then
+            pcall(Collect, root, found, 0)
+        end
+        return found
+    end
+
+    function Skip.Tick()
+        if not Hub.Crates then
+            return 0
+        end
+        local now = tick()
+        local clicked = 0
+        for _, button in ipairs(Skip.Find()) do
+            local last = Skip.Seen[button]
+            if not last or now - last >= Skip.Cooldown then
+                Skip.Seen[button] = now
+                local ok = Hub.Crates.Click(button)
+                if ok then
+                    clicked = clicked + 1
+                    Skip.Clicks = Skip.Clicks + 1
+                    Skip.LastAt = now
+                    pcall(function()
+                        Skip.LastPath = button:GetFullName()
+                    end)
+                end
+            end
+        end
+        return clicked
+    end
+
+    function Skip.Describe()
+        local found = Skip.Find()
+        if #found == 0 then
+            return "no skip buttons on screen"
+        end
+        local names = {}
+        for index, button in ipairs(found) do
+            if index > 5 then
+                table.insert(names, "+" .. tostring(#found - 5) .. " more")
+                break
+            end
+            table.insert(names, button:GetFullName())
+        end
+        return table.concat(names, "\n")
+    end
+
+    function Skip.SetEnabled(enabled)
+        Skip.Enabled = enabled == true
+        Skip.Token = Skip.Token + 1
+        if not Skip.Enabled then
+            Report("off")
+            return
+        end
+        local token = Skip.Token
+        Report("on")
+        task.spawn(function()
+            while Skip.Enabled and Skip.Token == token do
+                local ok, clicked = pcall(Skip.Tick)
+                if ok and clicked and clicked > 0 then
+                    Report(string.format("skipped %d | total %d", clicked, Skip.Clicks))
+                end
+                task.wait(Skip.Cadence)
+            end
+        end)
+    end
+
+    Hub.Skip = Skip
+end
+
+
 -- Fast Flags engine (ported from Cokeboys) + Fullbright ------------------------
 -- Wrapped in do/end so the new locals never raise the chunk's local count.
 do
@@ -9782,6 +10719,15 @@ State.PumpkinTimer = Config.PumpkinTimer ~= false
 State.PumpkinMinutes = math.clamp(math.floor(tonumber(Config.PumpkinMinutes) or 10), 1, 30)
 State.PumpkinByRoute = Config.PumpkinByRoute ~= false
 State.PumpkinRoutePasses = math.clamp(math.floor(tonumber(Config.PumpkinRoutePasses) or 2), 1, 10)
+State.CrateCursed = Config.CrateCursed ~= false
+State.CrateDiamond = Config.CrateDiamond == true
+State.CrateInterval = math.clamp(math.floor(tonumber(Config.CrateInterval) or 5), 1, 120)
+State.CrateAmount = math.clamp(math.floor(tonumber(Config.CrateAmount) or 3), 1, 100)
+State.CrateDiamondName = tostring(Config.CrateDiamondName or "MegaDiamond")
+State.CrateTopOnly = Config.CrateTopOnly ~= false
+State.CrateAutoRefresh = Config.CrateAutoRefresh ~= false
+State.CrateRefreshSeconds = math.clamp(math.floor(tonumber(Config.CrateRefreshSeconds) or 10), 3, 120)
+State.SkipBattlePass = Config.SkipBattlePass == true
 State.Fullbright = Config.Fullbright == true
 State.FullbrightBrightness = math.clamp(tonumber(Config.FullbrightBrightness) or 3, 0, 10)
 State.FullbrightAmbient = type(Config.FullbrightAmbient) == "table" and Config.FullbrightAmbient or { 200, 200, 200 }
@@ -9875,6 +10821,15 @@ local function SaveConfig()
         PumpkinMinutes = State.PumpkinMinutes,
         PumpkinByRoute = State.PumpkinByRoute,
         PumpkinRoutePasses = State.PumpkinRoutePasses,
+        CrateCursed = State.CrateCursed,
+        CrateDiamond = State.CrateDiamond,
+        CrateInterval = State.CrateInterval,
+        CrateAmount = State.CrateAmount,
+        CrateDiamondName = State.CrateDiamondName,
+        CrateTopOnly = State.CrateTopOnly,
+        CrateAutoRefresh = State.CrateAutoRefresh,
+        CrateRefreshSeconds = State.CrateRefreshSeconds,
+        SkipBattlePass = State.SkipBattlePass,
     }
     if Hub.Config and type(Hub.Config.Collect) == "function" then
         local collected, values = pcall(Hub.Config.Collect)
@@ -10826,6 +11781,235 @@ end
 
 Hub.Items.Listener = PaintItemStatus
 
+-- Crates + stock ---------------------------------------------------------------
+
+local CrateTab = Window:CreateTab({
+    Title = "Crates",
+    IconId = StarHubUI.Icons.Skull,
+    BadgeText = "LOOT",
+    LayoutOrder = 8,
+})
+
+local CrateBox = CrateTab:CreateGroupBox("Left", "Crate Opener", "CURSED / DIAMOND", StarHubUI.Icons.Skull)
+CrateBox:AddToggle("Auto Open Crates", "Opens the ticked crates on the timer below", State.CrateAuto, function(value)
+    State.CrateAuto = value == true
+    if Hub.Crates then
+        Hub.Crates.SetAuto(State.CrateAuto)
+    end
+    QueueSave()
+end)
+CrateBox:AddToggle("Cursed Crate", "Include the cursed crate in the rotation", State.CrateCursed, function(value)
+    State.CrateCursed = value == true
+    QueueSave()
+end)
+CrateBox:AddToggle("Diamond Crate", "Include the diamond crate in the rotation", State.CrateDiamond, function(value)
+    State.CrateDiamond = value == true
+    QueueSave()
+end)
+-- The side button is called MegaDiamond, so that is the name sent to the remote.
+-- Kept editable in case the server wants a different string.
+CrateBox:AddInput("Diamond Name", "MegaDiamond", State.CrateDiamondName, function(value)
+    local name = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then
+        name = "MegaDiamond"
+    end
+    State.CrateDiamondName = name
+    if Hub.Crates then
+        Hub.Crates.Names.diamond = name
+        Hub.Crates.Names.megadiamond = name
+    end
+    QueueSave()
+end)
+CrateBox:AddSlider("Open Every", 1, 120, State.CrateInterval, " s", function(value)
+    State.CrateInterval = math.clamp(math.floor(tonumber(value) or 5), 1, 120)
+    QueueSave()
+end)
+-- The 3 in NotGambling:FireServer(3, "Golden") - kept adjustable because the
+-- server decides what it means (amount / tier / index).
+CrateBox:AddSlider("Open Amount", 1, 10, State.CrateAmount, "x", function(value)
+    State.CrateAmount = math.clamp(math.floor(tonumber(value) or 3), 1, 10)
+    QueueSave()
+end)
+Gui.CrateStatus = MakeInfoRow(CrateBox, "Crates: idle", "auto off", StarHubUI.Icons.Skull)
+CrateBox:AddActionRow("Open Cursed Now", "Fires NotGambling(amount, \"Cursed\")", StarHubUI.Icons.Zap, function()
+    local ok, message = Hub.Crates.Open("cursed")
+    Notify("Cursed Crate", tostring(message))
+end)
+CrateBox:AddActionRow("Open Diamond Now", "Fires NotGambling(amount, \"Diamond\")", StarHubUI.Icons.Zap, function()
+    local ok, message = Hub.Crates.Open("diamond")
+    Notify("Diamond Crate", tostring(message))
+end)
+local SkipBox = CrateTab:CreateGroupBox("Left", "Auto Skip", "REWARD SCREENS", StarHubUI.Icons.Zap)
+SkipBox:AddToggle("Auto Skip", "Clicks every Skip / SkipQuest button that appears", false, function(value)
+    State.SkipAuto = value == true
+    if Hub.Skip then
+        Hub.Skip.SetEnabled(State.SkipAuto)
+    end
+end)
+SkipBox:AddToggle("Include BattlePass Skip1/5/10", "Those may spend currency - off by default", State.SkipBattlePass, function(value)
+    State.SkipBattlePass = value == true
+    if Hub.Skip then
+        Hub.Skip.IncludeBattlePass = State.SkipBattlePass
+    end
+    QueueSave()
+end)
+Gui.SkipStatus = MakeInfoRow(SkipBox, "Auto skip: off", "0 skips", StarHubUI.Icons.Zap)
+SkipBox:AddActionRow("Skip Now", "One pass over the visible skip buttons", StarHubUI.Icons.Zap, function()
+    local clicked = Hub.Skip.Tick()
+    Notify("Auto Skip", string.format("%d clicked | total %d", clicked or 0, Hub.Skip.Clicks))
+end)
+SkipBox:AddActionRow("List Skip Buttons", "Shows the paths currently on screen", StarHubUI.Icons.Search, function()
+    Notify("Auto Skip", Hub.Skip.Describe())
+end)
+
+-- One label inside a scroll frame: the stock list is text, so a single
+-- auto-sized label is enough and it never fights with a UIListLayout.
+local function MakeStockList(box, height)
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, 0, 0, height)
+    scroll.BackgroundColor3 = SHTheme.SubBox
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 4
+    scroll.ScrollBarImageColor3 = SHTheme.BorderLight
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ClipsDescendants = true
+    scroll.Parent = box.Container
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingLeft = UDim.new(0, 8)
+    padding.PaddingRight = UDim.new(0, 8)
+    padding.PaddingTop = UDim.new(0, 6)
+    padding.PaddingBottom = UDim.new(0, 6)
+    padding.Parent = scroll
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 0, 0)
+    label.AutomaticSize = Enum.AutomaticSize.Y
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 12
+    label.TextColor3 = SHTheme.TextBody
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Top
+    label.TextWrapped = true
+    label.Text = "not scanned yet"
+    label.Parent = scroll
+
+    local wrapper = {}
+    function wrapper:SetText(text)
+        label.Text = tostring(text or "")
+    end
+    return wrapper
+end
+
+local StockBox = CrateTab:CreateGroupBox("Right", "Stock: Legendary - Secret", "LIVE", StarHubUI.Icons.Dashboard)
+
+-- The panel keeps showing the previous crate until its side button is pressed,
+-- so switching and rescanning is one action here.
+StockBox:AddActionRow("Show Cursed Stock", "Presses Side.Boxes.Cursed, then rescans", StarHubUI.Icons.Skull, function()
+    local ok, message = Hub.Crates.SelectAndScan("cursed")
+    Notify("Stock", tostring(message))
+end)
+StockBox:AddActionRow("Show Diamond Stock", "Presses Side.Boxes.MegaDiamond, then rescans", StarHubUI.Icons.Dashboard, function()
+    local ok, message = Hub.Crates.SelectAndScan("diamond")
+    Notify("Stock", tostring(message))
+end)
+StockBox:AddToggle("Auto Refresh", "Rescans the stock list on a timer", State.CrateAutoRefresh, function(value)
+    State.CrateAutoRefresh = value == true
+    if Hub.Crates then
+        Hub.Crates.SetAutoRefresh(State.CrateAutoRefresh)
+    end
+    QueueSave()
+end)
+StockBox:AddSlider("Refresh Every", 3, 120, State.CrateRefreshSeconds, " s", function(value)
+    State.CrateRefreshSeconds = math.clamp(math.floor(tonumber(value) or 10), 3, 120)
+    if Hub.Crates and State.CrateAutoRefresh then
+        Hub.Crates.SetAutoRefresh(true)
+    end
+    QueueSave()
+end)
+StockBox:AddToggle("Only Legendary+", "Hides anything below legendary", State.CrateTopOnly, function(value)
+    State.CrateTopOnly = value == true
+    QueueSave()
+end)
+Gui.StockStatus = MakeInfoRow(StockBox, "Stock: not scanned", "press Scan Stock", StarHubUI.Icons.Dashboard)
+Gui.StockList = MakeStockList(StockBox, 150)
+StockBox:AddActionRow("Scan Stock", "Reads every stock card, tagged by crate", StarHubUI.Icons.Refresh, function()
+    local list = Hub.Crates.ScanStock()
+    Notify("Stock", string.format("%d entries | source: %s", #list, tostring(Hub.Crates.StockSource or "?")))
+end)
+local function PaintCrateStatus()
+    local Crates = Hub.Crates
+    if not Crates then
+        return
+    end
+    if Gui.CrateStatus then
+        local nextIn = ""
+        if Crates.AutoRunning and (Crates.NextAutoAt or 0) > 0 then
+            nextIn = string.format(" | next in %ds", math.max(0, math.floor(Crates.NextAutoAt - tick())))
+        end
+        Gui.CrateStatus:SetTitle("Crates: " .. tostring(Crates.Status))
+        Gui.CrateStatus:SetDesc(string.format("auto %s | opened %d | click %s%s",
+            Crates.AutoRunning and "on" or "off",
+            Crates.Opens or 0,
+            tostring(Crates.LastClickMethod),
+            nextIn))
+    end
+    if Gui.StockStatus then
+        local age = ""
+        if (Crates.StockUpdatedAt or 0) > 0 then
+            age = string.format(" | %ds ago", math.max(0, math.floor(tick() - Crates.StockUpdatedAt)))
+        end
+        local crateLabel = tostring(Crates.DetectedCrate or "unknown")
+        crateLabel = string.upper(string.sub(crateLabel, 1, 1)) .. string.sub(crateLabel, 2)
+        Gui.StockStatus:SetTitle(string.format("Stock: %s | %d cards",
+            crateLabel, #(Crates.Stock or {})))
+        Gui.StockStatus:SetDesc(tostring(Crates.StockStatus) .. age)
+    end
+    if Gui.StockList then
+        Gui.StockList:SetText(Crates.StockLines(40))
+    end
+    if Gui.SkipStatus and Hub.Skip then
+        Gui.SkipStatus:SetTitle("Auto skip: " .. (Hub.Skip.Enabled and "on" or "off"))
+        Gui.SkipStatus:SetDesc(string.format("%d skipped | battlepass %s | last %s",
+            Hub.Skip.Clicks or 0,
+            Hub.Skip.IncludeBattlePass and "on" or "off",
+            (Hub.Skip.LastAt or 0) > 0
+                and string.format("%ds ago", math.max(0, math.floor(tick() - Hub.Skip.LastAt)))
+                or "never"))
+    end
+end
+
+Hub.Crates.Listener = PaintCrateStatus
+Hub.Skip.Listener = function()
+    pcall(PaintCrateStatus)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Gui.CrateStatus then
+            pcall(PaintCrateStatus)
+        end
+    end
+end)
+
+task.defer(function()
+    pcall(function()
+        Hub.Crates.ScanStock()
+    end)
+    if State.CrateAuto then
+        pcall(Hub.Crates.SetAuto, true)
+    end
+    if State.CrateAutoRefresh then
+        pcall(Hub.Crates.SetAutoRefresh, true)
+    end
+    pcall(function()
+        Hub.Skip.IncludeBattlePass = State.SkipBattlePass == true
+    end)
+end)
+
 FarmStatusListener = function()
     if Gui.DoorFarmStatus then
         Gui.DoorFarmStatus:SetTitle("Points: " .. tostring(Farm.DoorCount))
@@ -10921,12 +12105,12 @@ do
         return area
     end
 
-    Window:AddNavHeader("CLIENT", 8)
+    Window:AddNavHeader("CLIENT", 9)
 
     local ClientTab = Window:CreateTab({
         Title = "Client",
         IconId = StarHubUI.Icons.Settings,
-        LayoutOrder = 9,
+        LayoutOrder = 10,
     })
 
     local FFlagBox = ClientTab:CreateGroupBox("Left", "Fast Flags", "JSON", StarHubUI.Icons.Save)
@@ -11258,12 +12442,12 @@ do
     RefreshPresetList()
 
     -- Fullbright ---------------------------------------------------------------
-    Window:AddNavHeader("VISUALS", 10)
+    Window:AddNavHeader("VISUALS", 11)
 
     local LightTab = Window:CreateTab({
         Title = "Lighting",
         IconId = StarHubUI.Icons.Visuals,
-        LayoutOrder = 11,
+        LayoutOrder = 12,
     })
 
     local BrightBox = LightTab:CreateGroupBox("Left", "Fullbright", "LIGHTING", StarHubUI.Icons.Visuals)
@@ -11372,12 +12556,12 @@ do
     end
 end
 
-Window:AddNavHeader("CONFIG", 12)
+Window:AddNavHeader("CONFIG", 13)
 
 local SystemTab = Window:CreateTab({
     Title = "System & Theme",
     IconId = StarHubUI.Icons.Settings,
-    LayoutOrder = 13,
+    LayoutOrder = 14,
 })
 Window:CreateDualColumnSettings(SystemTab)
 
@@ -11794,7 +12978,7 @@ do
     local ConfigTab = Window:CreateTab({
         Title = "Configs",
         IconId = StarHubUI.Icons.Save,
-        LayoutOrder = 14,
+        LayoutOrder = 15,
     })
 
     local SlotBox = ConfigTab:CreateGroupBox("Left", "Saved Configs", "SLOTS", StarHubUI.Icons.Save)
