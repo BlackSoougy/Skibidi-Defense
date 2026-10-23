@@ -99,6 +99,11 @@ local State = {
     FpsCapLast = 240,
     Pumpkinspice = false,
     PumpkinspiceReset = true,
+    PumpkinOnCooldown = false,
+    PumpkinTimer = true,
+    PumpkinMinutes = 10,
+    PumpkinByRoute = true,
+    PumpkinRoutePasses = 2,
     Basket = false,
 }
 
@@ -7020,7 +7025,15 @@ local function DoorLoop(gen)
                 FarmReportFor("door", "no points")
                 Farm.DoorNextAt = now + 5
             else
+                local cursorBefore = Farm.DoorCursor
                 local chosen, index, total, waitFor = FarmNext(points, "DoorCursor", Farm.DoorVisited, State.DoorCooldown)
+                -- Курсор обернулся через весь список: маршрут по точкам пройден
+                -- целиком. Это второй триггер для кофе, независимый от таймера.
+                if chosen and Farm.DoorCursor == 1 and cursorBefore ~= 1 then
+                    if Hub.Items and Hub.Items.NoteDoorPass then
+                        Hub.Items.NoteDoorPass()
+                    end
+                end
                 if not chosen then
                     FarmReportFor("door", "all " .. tostring(total) .. " points on cooldown, next in "
                         .. tostring(math.ceil(waitFor or 10)) .. "s")
@@ -8174,6 +8187,9 @@ do
         LastToastAt = 0,
         PumpkinStatus = "idle",
         BasketStatus = "idle",
+        NextPumpkinTimerAt = 0,
+        PumpkinPasses = 0,
+        PumpkinLastBy = "none",
         Listener = nil,
         Running = true,
         ReportToken = 0,
@@ -8261,15 +8277,51 @@ do
         return true, nil
     end
 
-    function Items.UsePumpkinspice()
+    --==========================================================================
+    -- Pumpkinspice (он же «кофе»)
+    -- Три независимых условия, каждое включается отдельно:
+    --   1) все точки на кулдауне  - старое поведение;
+    --   2) таймер от 1 до 30 минут;
+    --   3) маршрут по точкам пройден N раз (по умолчанию 2).
+    -- Кто сработал первым, тот и использует; после использования таймер и
+    -- счётчик проходов начинаются заново, иначе условия били бы подряд.
+    --==========================================================================
+
+    function Items.PumpkinInterval()
+        local minutes = tonumber(State.PumpkinMinutes) or 10
+        return math.clamp(math.floor(minutes), 1, 30) * 60
+    end
+
+    function Items.ArmPumpkinTimer()
+        Items.NextPumpkinTimerAt = tick() + Items.PumpkinInterval()
+    end
+
+    function Items.UsePumpkinspice(reason)
         local ok, err = Fire(Items.PumpkinItem)
+        local now = tick()
         if ok then
             Items.PumpkinUses = Items.PumpkinUses + 1
-            Items.PumpkinStatus = "used x" .. tostring(Items.PumpkinUses)
+            Items.PumpkinLastBy = tostring(reason or "manual")
+            Items.NextPumpkinTimerAt = now + Items.PumpkinInterval()
+            Items.PumpkinPasses = 0
+            Items.PumpkinStatus = string.format("used x%d via %s", Items.PumpkinUses, Items.PumpkinLastBy)
         else
             Items.PumpkinStatus = tostring(err)
         end
         return ok, err
+    end
+
+    -- Зовётся из дверного цикла, когда курсор обернулся через весь список.
+    function Items.NoteDoorPass()
+        if not State.Pumpkinspice or not State.PumpkinByRoute then
+            Items.PumpkinPasses = 0
+            return
+        end
+        Items.PumpkinPasses = Items.PumpkinPasses + 1
+        local need = math.clamp(math.floor(tonumber(State.PumpkinRoutePasses) or 2), 1, 10)
+        if Items.PumpkinPasses >= need then
+            Items.UsePumpkinspice("route")
+        end
     end
 
     function Items.UseBasket()
@@ -8502,9 +8554,29 @@ do
             end
 
             if State.Pumpkinspice then
-                if now >= Items.NextPumpkinAt and Items.AllDoorsCooling() then
+                local reason = nil
+
+                -- 1) Таймер: от 1 до 30 минут, отсчёт от последнего использования.
+                if State.PumpkinTimer then
+                    if Items.NextPumpkinTimerAt == 0 then
+                        Items.ArmPumpkinTimer()
+                    elseif now >= Items.NextPumpkinTimerAt then
+                        reason = "timer"
+                    end
+                end
+
+                -- 2) Старое условие: все точки на кулдауне.
+                if not reason
+                    and State.PumpkinOnCooldown
+                    and now >= Items.NextPumpkinAt
+                    and Items.AllDoorsCooling()
+                then
+                    reason = "cooldown"
+                end
+
+                if reason then
                     Items.NextPumpkinAt = now + PumpkinRetry
-                    Items.UsePumpkinspice()
+                    Items.UsePumpkinspice(reason)
                     if State.PumpkinspiceReset then
                         ResetDoorCycle()
                     end
@@ -9705,6 +9777,11 @@ State.MatchesBeforeLobby = math.max(1, math.floor(tonumber(Config.MatchesBeforeL
 State.MatchesCompleted = math.max(0, math.floor(tonumber(Config.MatchesCompleted) or 0))
 State.LastCountedJobId = tostring(Config.LastCountedJobId or "")
 State.PendingLobbyReturn = Config.PendingLobbyReturn == true
+State.PumpkinOnCooldown = Config.PumpkinOnCooldown == true
+State.PumpkinTimer = Config.PumpkinTimer ~= false
+State.PumpkinMinutes = math.clamp(math.floor(tonumber(Config.PumpkinMinutes) or 10), 1, 30)
+State.PumpkinByRoute = Config.PumpkinByRoute ~= false
+State.PumpkinRoutePasses = math.clamp(math.floor(tonumber(Config.PumpkinRoutePasses) or 2), 1, 10)
 State.Fullbright = Config.Fullbright == true
 State.FullbrightBrightness = math.clamp(tonumber(Config.FullbrightBrightness) or 3, 0, 10)
 State.FullbrightAmbient = type(Config.FullbrightAmbient) == "table" and Config.FullbrightAmbient or { 200, 200, 200 }
@@ -9793,6 +9870,11 @@ local function SaveConfig()
         FovValue = State.FovValue,
         FpsCap = State.FpsCap,
         FpsCapLast = State.FpsCapLast,
+        PumpkinOnCooldown = State.PumpkinOnCooldown,
+        PumpkinTimer = State.PumpkinTimer,
+        PumpkinMinutes = State.PumpkinMinutes,
+        PumpkinByRoute = State.PumpkinByRoute,
+        PumpkinRoutePasses = State.PumpkinRoutePasses,
     }
     if Hub.Config and type(Hub.Config.Collect) == "function" then
         local collected, values = pcall(Hub.Config.Collect)
@@ -10638,15 +10720,57 @@ FarmUtilBox:AddActionRow("Stop Everything", "Stops both farms immediately", Star
 end)
 
 local ItemBox = FarmTab:CreateGroupBox("Left", "Auto Items", "ITEMS", StarHubUI.Icons.Zap)
-ItemBox:AddToggle("Auto Use Pumpkinspice", "Fires only when every door reports the cooldown message", State.Pumpkinspice, function(value)
+ItemBox:AddToggle("Auto Use Pumpkinspice", "Master switch - uses it by the triggers below", State.Pumpkinspice, function(value)
     State.Pumpkinspice = value == true
+    if Hub.Items then
+        Hub.Items.PumpkinPasses = 0
+        Hub.Items.NextPumpkinTimerAt = 0
+        if State.Pumpkinspice and State.PumpkinTimer then
+            Hub.Items.ArmPumpkinTimer()
+        end
+    end
     QueueSave()
 end)
 ItemBox:AddToggle("Reset Doors After Use", "Clears the farm cooldown table so the doors get retried", State.PumpkinspiceReset, function(value)
     State.PumpkinspiceReset = value == true
     QueueSave()
 end)
-Gui.PumpkinStatus = MakeInfoRow(ItemBox, "Pumpkinspice: idle", "waiting for every door to report cooldown", StarHubUI.Icons.Save)
+-- Pumpkinspice он же «кофе»: три независимых триггера, каждый отдельно -----
+ItemBox:AddToggle("Trigger: All Doors Cooling", "Uses it when every point reports the cooldown message", State.PumpkinOnCooldown, function(value)
+    State.PumpkinOnCooldown = value == true
+    QueueSave()
+end)
+ItemBox:AddToggle("Trigger: Timer", "Uses it on a timer", State.PumpkinTimer, function(value)
+    State.PumpkinTimer = value == true
+    if Hub.Items then
+        Hub.Items.NextPumpkinTimerAt = 0
+        if State.PumpkinTimer then
+            Hub.Items.ArmPumpkinTimer()
+        end
+    end
+    QueueSave()
+end)
+ItemBox:AddSlider("Coffee Timer", 1, 30, State.PumpkinMinutes, " min", function(value)
+    State.PumpkinMinutes = math.clamp(math.floor(tonumber(value) or 10), 1, 30)
+    if Hub.Items and State.PumpkinTimer then
+        Hub.Items.ArmPumpkinTimer()
+    end
+    QueueSave()
+end)
+ItemBox:AddToggle("Trigger: After Route Passes", "Uses it when the point route is walked N times", State.PumpkinByRoute, function(value)
+    State.PumpkinByRoute = value == true
+    if Hub.Items then
+        Hub.Items.PumpkinPasses = 0
+    end
+    QueueSave()
+end)
+ItemBox:AddSlider("Route Passes", 1, 10, State.PumpkinRoutePasses, "x", function(value)
+    State.PumpkinRoutePasses = math.clamp(math.floor(tonumber(value) or 2), 1, 10)
+    QueueSave()
+end)
+Gui.PumpkinStatus = MakeInfoRow(ItemBox, "Pumpkinspice: idle",
+    string.format("timer %d min | route %dx", State.PumpkinMinutes, State.PumpkinRoutePasses),
+    StarHubUI.Icons.Save)
 ItemBox:AddToggle("Auto Use 2x Drop (Pumpkin)", "Uses UpgradedBasket whenever it is available", State.Basket, function(value)
     State.Basket = value == true
     QueueSave()
@@ -10668,14 +10792,24 @@ ItemBox:AddActionRow("Show Item Status", "Prints the cooldown toast counter and 
         Hub.Items.BasketUses))
 end)
 
+
 local function PaintItemStatus()
     if not Hub.Items then
         return
     end
     if Gui.PumpkinStatus then
         Gui.PumpkinStatus:SetTitle("Pumpkinspice: " .. tostring(Hub.Items.PumpkinStatus))
-        Gui.PumpkinStatus:SetDesc(string.format("cooldown toasts: %d | all doors: %s",
-            Hub.Items.ToastCount, Hub.Items.AllDoorsCooling() and "yes" or "no"))
+        local left = math.max(0, (Hub.Items.NextPumpkinTimerAt or 0) - tick())
+        Gui.PumpkinStatus:SetDesc(string.format(
+            "uses %d | route %d/%d | timer %d min | next %s",
+            Hub.Items.PumpkinUses or 0,
+            Hub.Items.PumpkinPasses or 0,
+            math.clamp(math.floor(tonumber(State.PumpkinRoutePasses) or 2), 1, 10),
+            math.clamp(math.floor(tonumber(State.PumpkinMinutes) or 10), 1, 30),
+            (State.Pumpkinspice and State.PumpkinTimer)
+                and string.format("%d:%02d", math.floor(left / 60), math.floor(left % 60))
+                or "off"
+        ))
     end
     if Gui.DoorStatsRow and Hub.Items.Rewards then
         local r = Hub.Items.Rewards
