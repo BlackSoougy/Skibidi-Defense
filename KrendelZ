@@ -118,6 +118,9 @@ local State = {
     CrateAutoRefresh = true,
     CrateRefreshSeconds = 10,
     SkipBattlePass = false,
+    AutoLoad = false,
+    AutoLoadSource = "",
+    AutoLoadDelay = 2,
 }
 
 local MacroFolder = "SkibidiDefense_Macros"
@@ -5560,10 +5563,16 @@ function StarHubUI:CreateWindow(cfg)
         local QuickBox = tabObj:CreateGroupBox("Right", "QUICK INSTANCE CONTROL", nil, StarHubUI.Icons.Refresh)
         QuickBox:AddActionRow("Reconnect Instance", "Rejoin current place server directly", StarHubUI.Icons.Refresh, function()
             StarHubUI:Notify({Title = "TELEPORT", Content = "Reconnecting to server...", Duration = 3})
+            if Hub and Hub.AutoLoad and State.AutoLoad then
+                pcall(Hub.AutoLoad.Arm, true)
+            end
             TeleportService:Teleport(game.PlaceId, LocalPlayer)
         end)
         QuickBox:AddActionRow("Server Hop", "Relocate to lowest ping active instance", StarHubUI.Icons.Server, function()
             StarHubUI:Notify({Title = "SERVER HOP", Content = "Routing to optimal cluster instance...", Duration = 3})
+            if Hub and Hub.AutoLoad and State.AutoLoad then
+                pcall(Hub.AutoLoad.Arm, true)
+            end
             TeleportService:Teleport(game.PlaceId, LocalPlayer)
         end)
         QuickBox:AddActionRow("Discord Community", "Copy encrypted access link to clipboard", StarHubUI.Icons.Copy, function()
@@ -11090,6 +11099,9 @@ State.FovValue = math.clamp(tonumber(Config.FovValue) or 70, 1, 200)
 State.SlenderRun = Config.SlenderRun == true
 State.SlenderPageDelay = math.clamp(math.floor(tonumber(Config.SlenderPageDelay) or 2), 1, 10)
 State.SlenderCaveDelay = math.clamp(math.floor(tonumber(Config.SlenderCaveDelay) or 5), 1, 20)
+State.AutoLoad = Config.AutoLoad == true
+State.AutoLoadSource = tostring(Config.AutoLoadSource or "")
+State.AutoLoadDelay = math.clamp(math.floor(tonumber(Config.AutoLoadDelay) or 2), 0, 15)
 -- Дверной фарм зафиксирован: виджеты убраны, значения не читаются из конфига,
 -- иначе старый сохранённый конфиг вернул бы прежние настройки.
 State.DoorTravel = true
@@ -11179,6 +11191,9 @@ local function SaveConfig()
         CrateAutoRefresh = State.CrateAutoRefresh,
         CrateRefreshSeconds = State.CrateRefreshSeconds,
         SkipBattlePass = State.SkipBattlePass,
+        AutoLoad = State.AutoLoad,
+        AutoLoadSource = State.AutoLoadSource,
+        AutoLoadDelay = State.AutoLoadDelay,
         SlenderRun = State.SlenderRun,
         SlenderPageDelay = State.SlenderPageDelay,
         SlenderCaveDelay = State.SlenderCaveDelay,
@@ -11216,6 +11231,9 @@ if State.PendingLobbyReturn then
             if State.Running and State.PendingLobbyReturn then
                 local triggered, buttonMessage = TriggerBackLobbyButton()
                 if not triggered then
+                    if Hub.AutoLoad and State.AutoLoad then
+                        pcall(Hub.AutoLoad.Arm, true)
+                    end
                     local ok, teleportMessage = pcall(function()
                         TeleportService:Teleport(LobbyPlaceId, LocalPlayer)
                     end)
@@ -12009,6 +12027,163 @@ CrystalBox:AddActionRow("Show Crystal Status", "Prints how many crystals were fo
     Notify("Crystal Farm", tostring(Farm.Message) .. " | crystals: " .. tostring(Farm.CrystalCount))
 end)
 
+-- Auto Load (re-execute on teleport) -------------------------------------------
+-- Взято из QuantumOnyx (OnAutoLoadScript / AutoLoadScriptonLoad) и усилено
+-- защитой от двойного запуска и цепочкой по JobId, как в Mammoth.
+do
+    local AutoLoad = {}
+    Hub.AutoLoad = AutoLoad
+
+    AutoLoad.Status = "idle"
+    AutoLoad.CacheFile = MacroFolder .. "/AutoLoadSource.lua"
+    AutoLoad.GuardKey = "StarHubAutoLoadJob"
+
+    function AutoLoad.GetQueue()
+        local env = getgenv and getgenv() or _G
+        local fn = env and rawget(env, "queue_on_teleport")
+        if type(fn) ~= "function" then
+            fn = rawget(_G, "queue_on_teleport")
+        end
+        if type(fn) ~= "function" then
+            fn = (env and rawget(env, "queueonteleport")) or rawget(_G, "queueonteleport")
+        end
+        if type(fn) ~= "function" then
+            local syn = rawget(_G, "syn")
+            if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+                fn = syn.queue_on_teleport
+            end
+        end
+        if type(fn) ~= "function" then
+            local fluxus = rawget(_G, "fluxus")
+            if type(fluxus) == "table" and type(fluxus.queue_on_teleport) == "function" then
+                fn = fluxus.queue_on_teleport
+            end
+        end
+        return type(fn) == "function" and fn or nil
+    end
+
+    function AutoLoad.IsUrl(text)
+        return type(text) == "string" and text:match("^%s*https?://%S+") ~= nil
+    end
+
+    function AutoLoad.Normalize(text)
+        if type(text) ~= "string" then return "" end
+        text = text:gsub("^%s+", ""):gsub("%s+$", "")
+        if text == "" then return "" end
+        if AutoLoad.IsUrl(text) then
+            return string.format('loadstring(game:HttpGet("%s"))()', text)
+        end
+        return text
+    end
+
+    function AutoLoad.BuildPayload(code, delay)
+        local guard = AutoLoad.GuardKey
+        return table.concat({
+            "-- StarHub auto load payload",
+            "task.spawn(function()",
+            "    repeat task.wait(1) until game:IsLoaded()",
+            string.format("    task.wait(%.2f)", delay),
+            string.format("    local g = getgenv and getgenv() or _G"),
+            string.format('    if g.%s == game.JobId then return end', guard),
+            string.format('    g.%s = game.JobId', guard),
+            "    local ok, err = pcall(function()",
+            "        local src = [=====[",
+            code,
+            "]=====]",
+            "        local chunk, loadErr = loadstring(src)",
+            "        if type(chunk) ~= 'function' then",
+            "            error(loadErr or 'loadstring failed', 0)",
+            "        end",
+            "        chunk()",
+            "    end)",
+            '    if not ok then warn("[StarHub auto load] " .. tostring(err)) end',
+            "end)",
+        }, "\n")
+    end
+
+    function AutoLoad.GetSource()
+        local saved = State.AutoLoadSource
+        if type(saved) == "string" and saved:find("%S") then
+            return AutoLoad.Normalize(saved)
+        end
+        local env = getgenv and getgenv() or _G
+        local alt = env and rawget(env, "StarHubAutoLoadSource")
+        if type(alt) == "string" and alt:find("%S") then
+            return AutoLoad.Normalize(alt)
+        end
+        -- Файл читается один раз: статус-строка дёргает GetSource постоянно.
+        if AutoLoad.FileSource == nil then
+            AutoLoad.FileSource = false
+            if HasFilesystem and isfile and readfile then
+                local ok, data = pcall(function()
+                    if isfile(AutoLoad.CacheFile) then
+                        return readfile(AutoLoad.CacheFile)
+                    end
+                end)
+                if ok and type(data) == "string" and data:find("%S") then
+                    AutoLoad.FileSource = data
+                end
+            end
+        end
+        if type(AutoLoad.FileSource) == "string" and AutoLoad.FileSource ~= "" then
+            return AutoLoad.Normalize(AutoLoad.FileSource)
+        end
+        return ""
+    end
+
+    function AutoLoad.SetSource(text)
+        State.AutoLoadSource = type(text) == "string" and text or ""
+        local normalized = AutoLoad.Normalize(State.AutoLoadSource)
+        AutoLoad.FileSource = normalized ~= "" and normalized or false
+        if HasFilesystem and writefile and normalized ~= "" then
+            pcall(function()
+                if makefolder and isfolder and not isfolder(MacroFolder) then
+                    makefolder(MacroFolder)
+                end
+                writefile(AutoLoad.CacheFile, normalized)
+            end)
+        end
+        QueueSave()
+    end
+
+    function AutoLoad.Arm(silent)
+        local code = AutoLoad.GetSource()
+        if code == "" then
+            AutoLoad.Status = "no source saved"
+            if not silent then Notify("Auto Load", AutoLoad.Status) end
+            return false
+        end
+        local queueFn = AutoLoad.GetQueue()
+        if not queueFn then
+            AutoLoad.Status = "executor has no queue_on_teleport"
+            if not silent then Notify("Auto Load", AutoLoad.Status) end
+            return false
+        end
+        local delay = math.clamp(tonumber(State.AutoLoadDelay) or 2, 0, 60)
+        local ok = pcall(queueFn, AutoLoad.BuildPayload(code, delay))
+        if ok then
+            AutoLoad.Status = string.format("armed | %.0fs | %d bytes", delay, #code)
+            AutoLoad.ArmedAt = os.clock()
+        else
+            AutoLoad.Status = "queue_on_teleport failed"
+        end
+        if not silent then Notify("Auto Load", AutoLoad.Status) end
+        return ok
+    end
+
+    function AutoLoad.Clear()
+        State.AutoLoadSource = ""
+        AutoLoad.FileSource = false
+        if HasFilesystem and delfile and isfile then
+            pcall(function()
+                if isfile(AutoLoad.CacheFile) then delfile(AutoLoad.CacheFile) end
+            end)
+        end
+        AutoLoad.Status = "source cleared"
+        QueueSave()
+    end
+end
+
 Gui.SlenderBox = FarmTab:CreateGroupBox("Left", "Slender Pages & Obby", "PAGES", StarHubUI.Icons.Teleport)
 Gui.SlenderToggle = Gui.SlenderBox:AddToggle("Slender: Pages + Obby",
     "Pages 1..12 with noclip (2s apart), then cave -> slenderman (5s)", State.SlenderRun, function(value)
@@ -12422,6 +12597,12 @@ FarmStatusListener = function()
             .. tostring(Farm.SlenderFound or 0) .. (Farm.SlenderRunning and " | running" or ""))
         Gui.SlenderStatus:SetDesc(tostring(Farm.SlenderMessage or "Idle"))
     end
+    if Gui.AutoLoadStatus and Hub.AutoLoad then
+        local hasSource = Hub.AutoLoad.GetSource() ~= ""
+        Gui.AutoLoadStatus:SetTitle("Auto Load: " .. tostring(Hub.AutoLoad.Status or "idle"))
+        Gui.AutoLoadStatus:SetDesc(hasSource and "source ready"
+            or "no source saved - paste a loadstring")
+    end
     if Gui.ClearStatus then
         if (Farm.ClearResolved or 0) > 0 then
             Gui.ClearStatus:SetTitle(string.format("Clear map: %d / %d objects",
@@ -12457,6 +12638,14 @@ if State.SlenderRun then
     task.defer(function()
         task.wait(1)
         task.spawn(Farm.SlenderRun)
+    end)
+end
+if State.AutoLoad then
+    task.defer(function()
+        task.wait(3)
+        if Hub.AutoLoad then
+            Hub.AutoLoad.Arm(true)
+        end
     end)
 end
 
@@ -12709,6 +12898,79 @@ do
     end)
 
     ApplyFpsCap()
+
+    -- Auto Load (QuantumOnyx style) -----------------------------------------
+    Gui.AutoLoadBox = ClientTab:CreateGroupBox("Right", "Auto Load On Teleport", "LOAD", StarHubUI.Icons.Refresh)
+    Gui.AutoLoadToggle = Gui.AutoLoadBox:AddToggle("Auto Load Script",
+        "Re-executes your loadstring after every teleport / server hop", State.AutoLoad, function(value)
+        State.AutoLoad = value == true
+        if State.AutoLoad then
+            Hub.AutoLoad.Arm(false)
+        else
+            Hub.AutoLoad.Status = "off"
+            Notify("Auto Load", "off")
+        end
+        QueueSave()
+    end)
+
+    local autoLoadArea = MakeTextArea(Gui.AutoLoadBox, "Loadstring / URL",
+        "https://... or loadstring(...)()", 80, function(text)
+        State.AutoLoadSource = text or ""
+    end)
+    autoLoadArea.Text = State.AutoLoadSource or ""
+    autoLoadArea.FocusLost:Connect(function()
+        Hub.AutoLoad.SetSource(autoLoadArea.Text)
+        if State.AutoLoad then
+            Hub.AutoLoad.Arm(true)
+        end
+    end)
+
+    Gui.AutoLoadBox:AddSlider("Load Delay", 0, 15, State.AutoLoadDelay, "SEC", function(value)
+        State.AutoLoadDelay = math.clamp(math.floor((tonumber(value) or 2) + 0.5), 0, 15)
+        QueueSave()
+    end)
+    Gui.AutoLoadStatus = MakeInfoRow(Gui.AutoLoadBox, "Auto Load: idle", "no source saved",
+        StarHubUI.Icons.Refresh)
+    Gui.AutoLoadBox:AddActionRow("Arm Now", "Queues the source for the next teleport",
+        StarHubUI.Icons.Zap, function()
+        Hub.AutoLoad.SetSource(autoLoadArea.Text)
+        Hub.AutoLoad.Arm(false)
+    end)
+    Gui.AutoLoadBox:AddActionRow("Paste From Clipboard", "Takes the loadstring straight from your clipboard",
+        StarHubUI.Icons.Copy, function()
+        local getter = getclipboard or (syn and syn.getclipboard)
+        if type(getter) ~= "function" then
+            Notify("Auto Load", "executor has no getclipboard")
+            return
+        end
+        local ok, data = pcall(getter)
+        if not ok or type(data) ~= "string" or not data:find("%S") then
+            Notify("Auto Load", "clipboard is empty")
+            return
+        end
+        autoLoadArea.Text = data
+        Hub.AutoLoad.SetSource(data)
+        Notify("Auto Load", "source taken from clipboard (" .. tostring(#data) .. " bytes)")
+        if State.AutoLoad then
+            Hub.AutoLoad.Arm(true)
+        end
+    end)
+    Gui.AutoLoadBox:AddActionRow("Show Payload", "Prints what would be queued for the next server",
+        StarHubUI.Icons.Search, function()
+        local code = Hub.AutoLoad.GetSource()
+        if code == "" then
+            Notify("Auto Load", "no source saved")
+            return
+        end
+        print("[AutoLoad] " .. Hub.AutoLoad.BuildPayload(code, tonumber(State.AutoLoadDelay) or 2))
+        Notify("Auto Load", "payload printed to console (" .. tostring(#code) .. " bytes)")
+    end)
+    Gui.AutoLoadBox:AddActionRow("Clear Source", "Wipes the saved loadstring and its cached copy",
+        StarHubUI.Icons.Skull, function()
+        Hub.AutoLoad.Clear()
+        autoLoadArea.Text = ""
+        Notify("Auto Load", "cleared")
+    end)
 
     -- Presets ------------------------------------------------------------------
     local PresetBox = ClientTab:CreateGroupBox("Right", "Presets", "AUTO", StarHubUI.Icons.Save)
