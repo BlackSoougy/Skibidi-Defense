@@ -78,6 +78,9 @@ local State = {
     CrystalFarm = false,
     CrystalInterval = 5,
     CrystalCooldown = 60,
+    SlenderRun = false,
+    SlenderPageDelay = 2,
+    SlenderCaveDelay = 5,
     AntiAfk = false,
     MenuFont = "Gotham",
     MenuFontScale = 100,
@@ -8137,6 +8140,349 @@ function Farm.StopCrystal()
     FarmReportFor("crystal", "crystal farm stopped")
 end
 
+--==========================================================================
+-- Slender: страницы 1..12 + скип обби, одной функцией
+--
+-- Всё живёт в ОДНОЙ функции Farm.SlenderRun. Порядок:
+--   1. включить ноклип
+--   2. обойти страницы 1..12, между ними пауза 2с (State.SlenderPageDelay)
+--   3. после последней страницы ноклип выключить
+--   4. тп в пещеру, 5с ожидания (State.SlenderCaveDelay)
+--   5. тп к слендермену
+--
+-- Страницы лежат по пути game:GetService("StarterGui").slenderman.<номер>.
+-- На клиенте копия StarterGui живёт в PlayerGui, поэтому путь проверяется
+-- сначала в PlayerGui, потом в StarterGui, а если там пусто - в мире
+-- ищутся объекты Page1..Page12 / 1..12. Так фарм не ломается от того,
+-- в какой из двух контейнеров игра положила листовки.
+--
+-- Взаимодействие сделано под оба устройства сразу, потому что на ПК и на
+-- телефоне это разные вещи:
+--   ProximityPrompt -> InputHoldBegin/InputHoldEnd (ровно то же, что делает
+--                      и клавиша E, и тап по кнопке промпта на экране)
+--   ClickDetector   -> fireclickdetector
+--   GuiButton       -> firesignal по Activated / MouseButton1Click
+--   касание         -> firetouchinterest
+--==========================================================================
+
+Farm.SlenderCave = Vector3.new(791.76, 693.89, -2141.13)
+Farm.SlenderBoss = Vector3.new(949.59, 574.72, -2143.36)
+Farm.SlenderRunning = false
+Farm.SlenderGen = 0
+Farm.SlenderFound = 0
+Farm.SlenderDone = 0
+Farm.SlenderMessage = "Idle"
+
+Farm.SlenderStop = function()
+    Farm.SlenderRunning = false
+    Farm.SlenderGen = (Farm.SlenderGen or 0) + 1
+    Farm.SlenderMessage = "stopped"
+    FarmReport("slender stopped")
+end
+
+Farm.SlenderRun = function()
+    if Farm.SlenderRunning then
+        return
+    end
+    Farm.SlenderRunning = true
+    Farm.SlenderGen = (Farm.SlenderGen or 0) + 1
+    Farm.SlenderDone = 0
+    local gen = Farm.SlenderGen
+    local pageDelay = math.clamp(tonumber(State.SlenderPageDelay) or 2, 0.2, 30)
+    local caveDelay = math.clamp(tonumber(State.SlenderCaveDelay) or 5, 0.2, 60)
+
+    local function alive()
+        return Farm.SlenderRunning and Farm.SlenderGen == gen
+    end
+
+    local function say(text)
+        Farm.SlenderMessage = tostring(text)
+        FarmReport(tostring(text))
+    end
+
+    -- Пауза, которую можно прервать: спим шагами по 0.1с и проверяем флаг.
+    local function hold(seconds)
+        local left = tonumber(seconds) or 0
+        while left > 0 and alive() do
+            local step = math.min(0.1, left)
+            task.wait(step)
+            left = left - step
+        end
+    end
+
+    local function goTo(position)
+        local root = FarmRoot()
+        if not root or not position then
+            return false
+        end
+        root.CFrame = CFrame.new(position)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        return true
+    end
+
+    local function goToPart(part)
+        local root = FarmRoot()
+        if not root or not part then
+            return false
+        end
+        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 2, 0))
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        return true
+    end
+
+    local function partOf(object)
+        if not object then
+            return nil
+        end
+        if object:IsA("BasePart") then
+            return object
+        end
+        local primary = nil
+        pcall(function()
+            primary = object.PrimaryPart
+        end)
+        if primary then
+            return primary
+        end
+        for _, item in ipairs(object:GetDescendants()) do
+            if item:IsA("BasePart") then
+                return item
+            end
+        end
+        return nil
+    end
+
+    -- Контейнер с листовками: PlayerGui -> StarterGui.
+    local function pageContainer()
+        local roots = {}
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        if playerGui then
+            roots[#roots + 1] = playerGui
+        end
+        local starterGui = game:GetService("StarterGui")
+        if starterGui then
+            roots[#roots + 1] = starterGui
+        end
+        for _, root in ipairs(roots) do
+            local direct = root:FindFirstChild("slenderman")
+            if direct then
+                return direct
+            end
+            for _, child in ipairs(root:GetChildren()) do
+                if string.lower(tostring(child.Name)) == "slenderman" then
+                    return child
+                end
+            end
+        end
+        return nil
+    end
+
+    local function pageByNumber(container, number)
+        local wanted = tostring(number)
+        for _, child in ipairs(container:GetChildren()) do
+            local name = tostring(child.Name)
+            if name == wanted then
+                return child
+            end
+            local digits = string.match(name, "(%d+)")
+            if digits and tonumber(digits) == number then
+                return child
+            end
+        end
+        return nil
+    end
+
+    local function collectPages()
+        local list = {}
+        local container = pageContainer()
+        if container then
+            for index = 1, 12 do
+                local object = pageByNumber(container, index)
+                if object then
+                    list[index] = object
+                end
+            end
+        end
+        local missing = false
+        for index = 1, 12 do
+            if not list[index] then
+                missing = true
+                break
+            end
+        end
+        if missing then
+            -- Запасной проход по миру: Page1..Page12 или просто 1..12.
+            local found = {}
+            pcall(function()
+                for _, object in ipairs(Workspace:GetDescendants()) do
+                    local name = string.lower(tostring(object.Name))
+                    local digits = string.match(name, "^pages?%s*(%d+)$")
+                    if not digits then
+                        digits = string.match(name, "^(%d+)$")
+                    end
+                    if digits then
+                        local number = tonumber(digits)
+                        if number and number >= 1 and number <= 12 and not found[number] then
+                            found[number] = object
+                        end
+                    end
+                end
+            end)
+            for index = 1, 12 do
+                if not list[index] and found[index] then
+                    list[index] = found[index]
+                end
+            end
+        end
+        return list
+    end
+
+    local function firePrompt(prompt)
+        local previous = prompt.RequiresLineOfSight
+        pcall(function()
+            prompt.RequiresLineOfSight = false
+        end)
+        local started = pcall(function()
+            prompt:InputHoldBegin()
+        end)
+        if started then
+            local waitFor = tonumber(prompt.HoldDuration) or 0
+            if waitFor > 0.4 then
+                waitFor = 0.4
+            end
+            if waitFor > 0 then
+                task.wait(waitFor)
+            end
+            pcall(function()
+                prompt:InputHoldEnd()
+            end)
+        elseif type(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, prompt)
+        end
+        pcall(function()
+            prompt.RequiresLineOfSight = previous
+        end)
+        return true
+    end
+
+    local function interact(object)
+        if not object then
+            return false
+        end
+        local prompts, detectors, buttons = {}, {}, {}
+        local function consider(item)
+            if item:IsA("ProximityPrompt") then
+                prompts[#prompts + 1] = item
+            elseif item:IsA("ClickDetector") then
+                detectors[#detectors + 1] = item
+            elseif item:IsA("GuiButton") then
+                buttons[#buttons + 1] = item
+            end
+        end
+        consider(object)
+        for _, item in ipairs(object:GetDescendants()) do
+            consider(item)
+        end
+
+        local fired = false
+        for _, prompt in ipairs(prompts) do
+            fired = firePrompt(prompt) or fired
+        end
+        for _, detector in ipairs(detectors) do
+            if type(fireclickdetector) == "function" and pcall(fireclickdetector, detector) then
+                fired = true
+            end
+        end
+        for _, button in ipairs(buttons) do
+            if type(firesignal) == "function" then
+                pcall(firesignal, button.Activated)
+                pcall(firesignal, button.MouseButton1Click)
+                fired = true
+            end
+        end
+        local root = FarmRoot()
+        local part = partOf(object)
+        if root and part and type(firetouchinterest) == "function" then
+            pcall(firetouchinterest, root, part, 0)
+            task.wait(0.05)
+            pcall(firetouchinterest, root, part, 1)
+            fired = true
+        end
+        return fired
+    end
+
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local pages = collectPages()
+            local total = 0
+            for index = 1, 12 do
+                if pages[index] then
+                    total = total + 1
+                end
+            end
+            Farm.SlenderFound = total
+            say("pages found: " .. tostring(total) .. "/12")
+
+            if total > 0 then
+                Farm.SetNoclip(true)
+                say("noclip on | walking pages")
+                for index = 1, 12 do
+                    if not alive() then
+                        break
+                    end
+                    local page = pages[index]
+                    if page and page.Parent then
+                        local part = partOf(page)
+                        if part then
+                            goToPart(part)
+                            task.wait(0.35)
+                        end
+                        interact(page)
+                        Farm.SlenderDone = Farm.SlenderDone + 1
+                        say("page " .. tostring(index) .. "/12 | taken " .. tostring(Farm.SlenderDone) .. "/" .. tostring(total))
+                    else
+                        say("page " .. tostring(index) .. " missing")
+                    end
+                    hold(pageDelay)
+                end
+                Farm.SetNoclip(false)
+                say("pages done | noclip off")
+            else
+                say("no pages found | going to the obby")
+            end
+
+            if not alive() then
+                return
+            end
+
+            goTo(Farm.SlenderCave)
+            say("cave | waiting " .. tostring(caveDelay) .. "s")
+            hold(caveDelay)
+            if not alive() then
+                return
+            end
+
+            goTo(Farm.SlenderBoss)
+            say("slenderman | done " .. tostring(Farm.SlenderDone) .. "/12")
+        end)
+
+        Farm.SetNoclip(false)
+        Farm.SlenderRunning = false
+        if not ok then
+            Farm.SlenderMessage = "error: " .. tostring(err)
+            FarmReport(Farm.SlenderMessage)
+        end
+        State.SlenderRun = false
+        if Gui and Gui.SlenderToggle then
+            pcall(function()
+                Gui.SlenderToggle:Set(false)
+            end)
+        end
+    end)
+end
+
 -- Anti-AFK --------------------------------------------------------------------
 -- Взято из QuantumOnyx: на каждый Idled сначала CaptureController, и только
 -- потом клик. Если кликнуть до захвата контроллера, Roblox его не засчитывает
@@ -10741,6 +11087,9 @@ State.FullbrightNoAtmosphere = Config.FullbrightNoAtmosphere ~= false
 State.FullbrightNoPost = Config.FullbrightNoPost ~= false
 State.FovEnabled = Config.FovEnabled == true
 State.FovValue = math.clamp(tonumber(Config.FovValue) or 70, 1, 200)
+State.SlenderRun = Config.SlenderRun == true
+State.SlenderPageDelay = math.clamp(math.floor(tonumber(Config.SlenderPageDelay) or 2), 1, 10)
+State.SlenderCaveDelay = math.clamp(math.floor(tonumber(Config.SlenderCaveDelay) or 5), 1, 20)
 -- Дверной фарм зафиксирован: виджеты убраны, значения не читаются из конфига,
 -- иначе старый сохранённый конфиг вернул бы прежние настройки.
 State.DoorTravel = true
@@ -10830,6 +11179,9 @@ local function SaveConfig()
         CrateAutoRefresh = State.CrateAutoRefresh,
         CrateRefreshSeconds = State.CrateRefreshSeconds,
         SkipBattlePass = State.SkipBattlePass,
+        SlenderRun = State.SlenderRun,
+        SlenderPageDelay = State.SlenderPageDelay,
+        SlenderCaveDelay = State.SlenderCaveDelay,
     }
     if Hub.Config and type(Hub.Config.Collect) == "function" then
         local collected, values = pcall(Hub.Config.Collect)
@@ -11657,6 +12009,52 @@ CrystalBox:AddActionRow("Show Crystal Status", "Prints how many crystals were fo
     Notify("Crystal Farm", tostring(Farm.Message) .. " | crystals: " .. tostring(Farm.CrystalCount))
 end)
 
+Gui.SlenderBox = FarmTab:CreateGroupBox("Left", "Slender Pages & Obby", "PAGES", StarHubUI.Icons.Teleport)
+Gui.SlenderToggle = Gui.SlenderBox:AddToggle("Slender: Pages + Obby",
+    "Pages 1..12 with noclip (2s apart), then cave -> slenderman (5s)", State.SlenderRun, function(value)
+    State.SlenderRun = value == true
+    if State.SlenderRun then
+        task.spawn(Farm.SlenderRun)
+    else
+        Farm.SlenderStop()
+    end
+    QueueSave()
+end)
+Gui.SlenderBox:AddSlider("Delay Between Pages", 1, 10, State.SlenderPageDelay, "SEC", function(value)
+    State.SlenderPageDelay = math.clamp(math.floor((tonumber(value) or 2) + 0.5), 1, 10)
+    QueueSave()
+end)
+Gui.SlenderBox:AddSlider("Delay Cave -> Slenderman", 1, 20, State.SlenderCaveDelay, "SEC", function(value)
+    State.SlenderCaveDelay = math.clamp(math.floor((tonumber(value) or 5) + 0.5), 1, 20)
+    QueueSave()
+end)
+Gui.SlenderStatus = MakeInfoRow(Gui.SlenderBox, "Pages: 0/12", "Idle", StarHubUI.Icons.Save)
+Gui.SlenderBox:AddActionRow("Scan Pages", "Shows how many pages the walk found and where", StarHubUI.Icons.Search, function()
+    Notify("Slender", "found: " .. tostring(Farm.SlenderFound or 0) .. "/12 | taken: "
+        .. tostring(Farm.SlenderDone or 0) .. " | " .. tostring(Farm.SlenderMessage or "Idle"))
+    print("[Slender] " .. tostring(Farm.SlenderMessage or "Idle"))
+end)
+Gui.SlenderBox:AddActionRow("Teleport To Cave", "Only the first half of the obby skip", StarHubUI.Icons.Teleport, function()
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        Notify("Slender", "no character")
+        return
+    end
+    root.CFrame = CFrame.new(Farm.SlenderCave)
+    root.AssemblyLinearVelocity = Vector3.zero
+    Notify("Slender", "cave")
+end)
+Gui.SlenderBox:AddActionRow("Teleport To Slenderman", "Only the second half of the obby skip", StarHubUI.Icons.Teleport, function()
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        Notify("Slender", "no character")
+        return
+    end
+    root.CFrame = CFrame.new(Farm.SlenderBoss)
+    root.AssemblyLinearVelocity = Vector3.zero
+    Notify("Slender", "slenderman")
+end)
+
 local FarmUtilBox = FarmTab:CreateGroupBox("Right", "Utility", "AFK", StarHubUI.Icons.Check)
 FarmUtilBox:AddToggle("Anti-AFK", "Captures the controller and clicks when Roblox counts you as idle", State.AntiAfk, function(value)
     State.AntiAfk = value == true
@@ -12019,6 +12417,11 @@ FarmStatusListener = function()
         Gui.CrystalFarmStatus:SetTitle("Crystals found: " .. tostring(Farm.CrystalCount))
         Gui.CrystalFarmStatus:SetDesc(tostring(Farm.CrystalMessage or "Idle"))
     end
+    if Gui.SlenderStatus then
+        Gui.SlenderStatus:SetTitle("Pages: " .. tostring(Farm.SlenderDone or 0) .. "/"
+            .. tostring(Farm.SlenderFound or 0) .. (Farm.SlenderRunning and " | running" or ""))
+        Gui.SlenderStatus:SetDesc(tostring(Farm.SlenderMessage or "Idle"))
+    end
     if Gui.ClearStatus then
         if (Farm.ClearResolved or 0) > 0 then
             Gui.ClearStatus:SetTitle(string.format("Clear map: %d / %d objects",
@@ -12048,6 +12451,12 @@ end
 if State.CrystalFarm then
     task.defer(function()
         Farm.StartCrystal()
+    end)
+end
+if State.SlenderRun then
+    task.defer(function()
+        task.wait(1)
+        task.spawn(Farm.SlenderRun)
     end)
 end
 
