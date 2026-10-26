@@ -7,6 +7,18 @@ local TeleportService = game:GetService("TeleportService")
 
 print("[StarHub] boot: local build (Fluent inlined)")
 
+-- Ранняя отметка в логе. Если меню не появилось, по этой строке сразу видно,
+-- что скрипт вообще запустился: иначе не отличить "упал до первого таба"
+-- от "его не выполнили вовсе".
+do
+    pcall(function()
+        if writefile then
+            writefile("StarHub_boot.log",
+                "boot start @ " .. string.format("%.2f", os.clock()))
+        end
+    end)
+end
+
 local LocalPlayer = Players.LocalPlayer
 local Environment = getgenv()
 
@@ -74,7 +86,7 @@ local State = {
     DoorFlightY = 0,
     DoorAnimFreeze = true,
     DoorInstant = true,
-    ClearMapAuto = false,
+    ClearMapAuto = true,
     PromptWalls = false,
     PromptAnywhere = false,
     CrystalFarm = false,
@@ -15838,27 +15850,78 @@ do local ab,ac,ad,ae,af,ag,ah,aj,c,e,f,g,h,i,j,k=task,setmetatable,error,newprox
             MinimizeKey = cfg.ToggleKey or Enum.KeyCode.RightShift,
         }
 
-        -- Если какой-то из новых параметров не переварится — падаем на
-        -- минимальный конфиг, но окно всё равно должно появиться.
-        local fluentWindow
-        local created, result = pcall(function()
-            return Fluent:CreateWindow(fullCfg)
-        end)
-        if created and result then
-            fluentWindow = result
-        else
-            warn("[StarHub] full window config failed: " .. tostring(result))
-            fluentWindow = Fluent:CreateWindow({
-                Title = tostring(cfg.Title or "Skibidi Defense Hub"),
-                SubTitle = "Made by: KrendelZ",
+        -- Окно создаётся лестницей: полный конфиг -> без акрила/фона ->
+        -- совсем голое. Каждая попытка в pcall и пишется в лог. Раньше при
+        -- отказе полного конфига вызывался ещё один CreateWindow без pcall,
+        -- он падал на дубликате ScreenGui, и наружу уходила ошибка — скрипт
+        -- умирал до первого таба, меню не появлялось.
+        local attempts = {
+            fullCfg,
+            {
+                Title = fullCfg.Title,
+                SubTitle = fullCfg.SubTitle,
+                Size = fullCfg.Size,
+                TabWidth = fullCfg.TabWidth,
+                Theme = "Dark",
+                Acrylic = false,
+                Background = false,
+                Font = "GothamSSm",
+                FolderName = "StarHubFluent",
+                ScreenGuiName = "StarHubFluentB",
+                MinimizeKey = fullCfg.MinimizeKey,
+            },
+            {
+                Title = fullCfg.Title,
                 Size = UDim2.fromOffset(680, 680),
                 TabWidth = 150,
                 Theme = "Dark",
                 Acrylic = false,
                 FolderName = "StarHubFluent",
-                ScreenGuiName = "StarHubFluent",
-                MinimizeKey = cfg.ToggleKey or Enum.KeyCode.RightShift,
-            })
+                ScreenGuiName = "StarHubFluentC",
+                MinimizeKey = fullCfg.MinimizeKey,
+            },
+        }
+
+        local function LogBoot(text)
+            pcall(function()
+                if writefile then
+                    writefile("StarHub_boot.log",
+                        tostring(text) .. " @ " .. string.format("%.2f", os.clock()))
+                end
+            end)
+        end
+
+        local fluentWindow, lastErr
+        for index = 1, #attempts do
+            local ok, res = pcall(function()
+                return Fluent:CreateWindow(attempts[index])
+            end)
+            if ok and res then
+                fluentWindow = res
+                LogBoot(string.format("createwindow ok (attempt %d)", index))
+                break
+            end
+            lastErr = res
+            warn(string.format("[StarHub] CreateWindow attempt %d failed: %s", index, tostring(res)))
+            LogBoot(string.format("createwindow FAIL %d: %s", index, tostring(res)))
+            -- Подчищаем недоделанный ScreenGui, иначе следующая попытка
+            -- упрётся в дубликат имени. Живой GUI библиотеки не трогаем:
+            -- Fluent.GUI — это тот же ScreenGui, и его удаление убивает всё.
+            pcall(function()
+                local coreGui = game:GetService("CoreGui")
+                local live = Fluent and Fluent.GUI
+                for _, child in ipairs(coreGui:GetChildren()) do
+                    if child:IsA("ScreenGui") and child ~= live
+                        and (child.Name == "StarHubFluent"
+                            or child.Name == "StarHubFluentB"
+                            or child.Name == "StarHubFluentC") then
+                        child:Destroy()
+                    end
+                end
+            end)
+        end
+        if not fluentWindow then
+            error("[StarHub] Fluent не создал окно: " .. tostring(lastErr))
         end
 
         -- Как в примере: уведомления рисуются внутри окна, а не поверх игры.
@@ -18112,9 +18175,14 @@ function Farm.ClearParse()
         local name, class, px, py, pz, sx, sy, sz =
             string.match(line, "^([^|]+)|([^|]+)|(%-?%d+),(%-?%d+),(%-?%d+)|(%-?%d+),(%-?%d+),(%-?%d+)|")
         if name then
+            -- Хвост строки — полный путь вида Workspace.Model.Folder.Map.House.Part.
+            -- Он не зависит от того, где карта стоит сейчас, поэтому по нему
+            -- можно достать объект, даже если позиции в журнале устарели.
+            local path = string.match(line, "|([%w%._%-]+)%s*$")
             list[#list + 1] = {
                 name = name,
                 class = class,
+                path = path,
                 x = tonumber(px),
                 y = tonumber(py),
                 z = tonumber(pz),
@@ -18300,7 +18368,16 @@ function Farm.ClearDetach(object, blocked)
     local ok = pcall(function()
         object.Parent = nil
     end)
-    return ok and object.Parent == nil
+    if not ok or object.Parent ~= nil then
+        return false
+    end
+    -- Отвязать мало: части, которыми владеет сервер, возвращаются
+    -- репликацией и снова оказываются на карте. Destroy() убивает инстанс
+    -- на этом клиенте окончательно.
+    pcall(function()
+        object:Destroy()
+    end)
+    return true
 end
 
 -- Размер совпал с точностью до студа. Нужен только закреплённым целям:
@@ -18399,6 +18476,77 @@ function Farm.SafeDescendants(root)
     return out
 end
 
+-- Достаём объект по полному пути из журнала (Workspace.Model.Folder.Map.House.Part).
+-- Позиции в ClearData сняты на конкретном сервере; если карта стоит иначе,
+-- проход по координатам не находит ничего, а путь остаётся верным.
+-- Одно и то же имя в пути встречается много раз, поэтому обходим все ветки
+-- и выбираем ту, что ближе всего к записанной позиции цели.
+function Farm.ClearResolvePath(path, target)
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    local segments = {}
+    for segment in string.gmatch(path, "[^%.]+") do
+        segments[#segments + 1] = segment
+    end
+    if segments[1] == "Workspace" then
+        table.remove(segments, 1)
+    end
+    if #segments == 0 then
+        return nil
+    end
+
+    local best, bestDist
+    local visits = 0
+    local function walk(node, index)
+        visits = visits + 1
+        if visits > 20000 then
+            return
+        end
+        if index > #segments then
+            if not (target and target.x) then
+                if not best then
+                    best = node
+                end
+                return
+            end
+            local ok, position = pcall(function()
+                if node:IsA("BasePart") then
+                    return node.Position
+                end
+                return node:GetPivot().Position
+            end)
+            if ok and position then
+                local dx = position.X - target.x
+                local dy = position.Y - target.y
+                local dz = position.Z - target.z
+                local dist = dx * dx + dy * dy + dz * dz
+                if not bestDist or dist < bestDist then
+                    best, bestDist = node, dist
+                end
+            elseif not best then
+                best = node
+            end
+            return
+        end
+        local name = segments[index]
+        local okKids, kids = pcall(function()
+            return node:GetChildren()
+        end)
+        if not okKids or not kids then
+            return
+        end
+        for _, child in ipairs(kids) do
+            if child.Name == name then
+                walk(child, index + 1)
+            end
+        end
+    end
+
+    pcall(walk, Workspace, 1)
+    return best
+end
+
 -- Один проход по Workspace.
 -- Удаляется только объект, у которого совпали ИМЯ и КЛАСС из списка, плюс
 -- либо позиция, либо (если позиции не совпали) размер. Ничего чужого.
@@ -18408,9 +18556,11 @@ function Farm.ClearPass()
     Farm.ClearTotal = #list
     local blocked = Farm.ClearBlocked()
 
-    local ok, items = pcall(Farm.SafeDescendants, Workspace)
+    local ok, items = pcall(function()
+        return Workspace:GetDescendants()
+    end)
     if not ok or not items then
-        Farm.ClearReport = "обход Workspace не сработал"
+        Farm.ClearReport = "Workspace:GetDescendants() не сработал"
         return 0
     end
 
@@ -18424,7 +18574,7 @@ function Farm.ClearPass()
         end
     end
 
-    local removed, seen, byPos, bySize, byPin = 0, 0, 0, 0, 0
+    local removed, seen, byPos, bySize, byPin, byPath = 0, 0, 0, 0, 0, 0
     local resolved = 0
 
     -- Проход 1: имя + класс + позиция (для закреплённых — ещё и размер).
@@ -18474,12 +18624,8 @@ function Farm.ClearPass()
     local allowSize = byPos > 0 or not Farm.ClearSizeUsed
     local allowPinned = byPin == 0 and not Farm.ClearPinnedSizeUsed
     if resolved < #list and allowSize then
-        local world, need, pass2 = {}, {}, 0
+        local world, need = {}, {}
         for _, item in ipairs(items) do
-            pass2 = pass2 + 1
-            if pass2 % 1500 == 0 then
-                task.wait()
-            end
             if item.Parent and item:IsDescendantOf(Workspace)
                 and (item:IsA("BasePart") or item:IsA("Model"))
                 and classes[item.ClassName]
@@ -18506,12 +18652,7 @@ function Farm.ClearPass()
                 need[sig] = (need[sig] or 0) + 1
             end
         end
-        local sigCount = 0
         for sig, count in pairs(need) do
-            sigCount = sigCount + 1
-            if sigCount % 150 == 0 then
-                task.wait()
-            end
             local bucket = world[sig]
             -- Удаляем, только если объектов с такой подписью не больше, чем
             -- целей: лишние объекты этого имени и размера не трогаем.
@@ -18539,6 +18680,23 @@ function Farm.ClearPass()
         end
     end
 
+    -- Проход 3: по полному пути из журнала. Страховка на случай, когда карта
+    -- стоит не там, где её снимали: координаты мимо, а путь
+    -- Workspace.Model.Folder.Map.House.Part всё ещё ведёт куда надо.
+    if resolved < #list then
+        for _, target in ipairs(list) do
+            if not target.done and target.path then
+                local node = Farm.ClearResolvePath(target.path, target)
+                if node and Farm.ClearDetach(node, blocked) then
+                    target.done = true
+                    resolved = resolved + 1
+                    removed = removed + 1
+                    byPath = byPath + 1
+                end
+            end
+        end
+    end
+
     -- Отчёт: что нашли, а каких имён в мире нет.
     local keyTotal, keyDone = {}, {}
     for _, target in ipairs(list) do
@@ -18560,8 +18718,8 @@ function Farm.ClearPass()
     Farm.ClearResolved = resolved
     Farm.ClearPinnedResolved = byPin
     Farm.ClearReport = string.format(
-        "объектов %d | целей %d из %d | позиция %d, закреп %d, размер %d | просмотрено %d",
-        removed, resolved, #list, byPos, byPin, bySize, seen)
+        "объектов %d | целей %d из %d | позиция %d, закреп %d, размер %d, путь %d | просмотрено %d",
+        removed, resolved, #list, byPos, byPin, bySize, byPath, seen)
     print("[Clear] " .. Farm.ClearReport)
     if #missing > 0 then
         table.sort(missing)
@@ -18579,6 +18737,15 @@ function Farm.ClearOnce()
     Farm.ClearRunning = true
     local ok, result = pcall(Farm.ClearPass)
     Farm.ClearRunning = false
+    -- Результат прохода — в файл: в консоли Potassium его не видно,
+    -- а по этим цифрам понятно, нашлись цели или нет.
+    pcall(function()
+        if writefile then
+            writefile("StarHub_boot.log",
+                "clear: " .. tostring(ok and Farm.ClearReport or ("ошибка: " .. tostring(result)))
+                .. " @ " .. string.format("%.2f", os.clock()))
+        end
+    end)
     if not ok then
         Farm.ClearReport = "ошибка прохода: " .. tostring(result)
         print("[Clear] " .. Farm.ClearReport)
@@ -21530,7 +21697,8 @@ do
         return StarHubUI:CreateWindow({
             Title = "Skibidi Defense Hub",
             SubTitle = "Made By KrendelZ :3",
-            Size = UDim2.new(0, 720, 0, 485),
+            -- Size НЕ передаём: CreateWindow берёт 680x680 как в Example.lua.
+            -- Раньше здесь стоял UDim2.new(0, 720, 0, 485) и перебивал его.
             ToggleKey = Enum.KeyCode.RightShift,
         })
     end)
@@ -21540,8 +21708,21 @@ do
         warn("[StarHub] CreateWindow error: " .. tostring(result))
     end
     if type(Window) ~= "table" then
+        pcall(function()
+            if writefile then
+                writefile("StarHub_boot.log",
+                    "window NIL: " .. tostring(result)
+                    .. " @ " .. string.format("%.2f", os.clock()))
+            end
+        end)
         error("[StarHub] Fluent не создал окно: " .. tostring(result))
     end
+    pcall(function()
+        if writefile then
+            writefile("StarHub_boot.log",
+                "window ready @ " .. string.format("%.2f", os.clock()))
+        end
+    end)
     print("[StarHub] window created, screen gui: "
         .. tostring(Window.ScreenGui and Window.ScreenGui.Name or "nil"))
 end
@@ -21961,7 +22142,7 @@ State.DoorOffsetZ = 0
 State.DoorInterval = 1
 State.DoorCooldown = 60
 State.PromptWalls = false
-State.ClearMapAuto = false
+State.ClearMapAuto = true
 State.PromptAnywhere = false
 State.FpsCap = math.max(0, math.floor(tonumber(Config.FpsCap) or 240))
 if State.FpsCap > 0 and State.FpsCap < 5 then
@@ -24892,7 +25073,7 @@ end
 -- Промпты вне экрана больше не включаются: клиент не даёт жать промпт,
 -- который сам не показал, так что режим был бесполезен.
 
-Farm.ClearAuto = State.ClearMapAuto == true
+Farm.ClearAuto = State.ClearMapAuto ~= false
 if Farm.ClearAuto then
     task.delay(4, function()
         Gui.Step("post:clearauto-run")
