@@ -16038,8 +16038,105 @@ do local ab,ac,ad,ae,af,ag,ah,aj,c,e,f,g,h,i,j,k=task,setmetatable,error,newprox
             end
         end
 
+        -- Окно никогда не должно быть больше экрана --------------------------
+        -- 680x680 на телефоне не влезает, поэтому режем по фактическому
+        -- ViewportSize. Вызывается при старте и на каждый поворот/ресайз.
+        function Window:FitToScreen()
+            local ok = pcall(function()
+                local camera = Workspace.CurrentCamera
+                if not camera then
+                    return
+                end
+                local viewport = camera.ViewportSize
+                if not viewport or viewport.X < 1 or viewport.Y < 1 then
+                    return
+                end
+                local root = fluentWindow.Root
+                if not root then
+                    return
+                end
+
+                local base = fluentWindow.Size
+                local wantW, wantH = 680, 680
+                if base then
+                    if base.X and base.X.Offset and base.X.Offset > 0 then
+                        wantW = base.X.Offset
+                    end
+                    if base.Y and base.Y.Offset and base.Y.Offset > 0 then
+                        wantH = base.Y.Offset
+                    end
+                end
+
+                -- Желаемый размер запоминаем один раз: иначе после первого
+                -- сжатия на телефоне окно уже не вырастет обратно на ПК.
+                if not Window._baseW then
+                    Window._baseW = wantW
+                    Window._baseH = wantH
+                else
+                    wantW = Window._baseW
+                    wantH = Window._baseH
+                end
+
+                -- Отступ по краям: на маленьком экране меньше, но окно
+                -- всегда остаётся внутри.
+                local padX = (viewport.X < 720) and 12 or 48
+                local padY = (viewport.Y < 620) and 12 or 48
+                local maxW = math.max(300, viewport.X - padX * 2)
+                local maxH = math.max(240, viewport.Y - padY * 2)
+
+                local w = math.clamp(wantW, 300, maxW)
+                local h = math.clamp(wantH, 240, maxH)
+                if w > maxW then w = maxW end
+                if h > maxH then h = maxH end
+
+                root.Size = UDim2.fromOffset(w, h)
+                root.Position = UDim2.fromOffset(
+                    math.floor(math.max(0, (viewport.X - w) / 2)),
+                    math.floor(math.max(0, (viewport.Y - h) / 2)))
+
+                fluentWindow.Size = UDim2.fromOffset(w, h)
+                fluentWindow.Position = root.Position
+            end)
+            return ok
+        end
+
         Window.Fluent = Fluent
         Window.ScreenGui = Fluent.GUI
+
+        -- Первичная подгонка и слежение за поворотом экрана / сменой камеры.
+        pcall(function()
+            Window:FitToScreen()
+        end)
+        task.defer(function()
+            pcall(function()
+                Window:FitToScreen()
+            end)
+        end)
+        task.delay(0.6, function()
+            pcall(function()
+                Window:FitToScreen()
+            end)
+        end)
+        pcall(function()
+            local camera = Workspace.CurrentCamera
+            if camera then
+                camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+                    pcall(function()
+                        Window:FitToScreen()
+                    end)
+                end)
+            end
+        end)
+        pcall(function()
+            Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+                local camera = Workspace.CurrentCamera
+                if camera then
+                    pcall(function()
+                        Window:FitToScreen()
+                    end)
+                end
+            end)
+        end)
 
         function Window:Destroy()
             pcall(function()
