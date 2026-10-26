@@ -16011,6 +16011,33 @@ do local ab,ac,ad,ae,af,ag,ah,aj,c,e,f,g,h,i,j,k=task,setmetatable,error,newprox
             end)
         end
 
+        -- Свернуть / развернуть окно без toggle-уведомления.
+        -- Fluent умеет Show()/Hide() и держит флаг Minimized.
+        function Window:SetMinimized(state)
+            pcall(function()
+                if state then
+                    fluentWindow:Hide()
+                else
+                    fluentWindow:Show()
+                end
+            end)
+        end
+
+        function Window:IsMinimized()
+            local ok, value = pcall(function()
+                return fluentWindow.Minimized
+            end)
+            return ok and value == true
+        end
+
+        function Window:ToggleMinimized()
+            if Window:IsMinimized() then
+                Window:SetMinimized(false)
+            else
+                Window:SetMinimized(true)
+            end
+        end
+
         Window.Fluent = Fluent
         Window.ScreenGui = Fluent.GUI
 
@@ -21727,6 +21754,59 @@ do
         .. tostring(Window.ScreenGui and Window.ScreenGui.Name or "nil"))
 end
 
+-- Кнопка меню (мобильные) -----------------------------------------------------
+-- Плавающая иконка поверх игры: тап открывает и сворачивает окно, удержание
+-- фиксирует её на месте, перетаскивание двигает. Взято из самого Fluent
+-- (CreateMinimizer), поэтому выглядит родным, а не самодельным.
+Gui.Minimizer = nil
+Gui.MinimizerVisible = true
+do
+    local lib = StarHubUI.Fluent
+    local isTouch = game:GetService("UserInputService").TouchEnabled
+    if lib and type(lib.CreateMinimizer) == "function" then
+        local ok, minimizer = pcall(function()
+            return lib:CreateMinimizer({
+                Icon = StarHubUI.Icons.Logo or StarHubUI.Icons.Settings,
+                Size = UDim2.fromOffset(isTouch and 58 or 52, isTouch and 58 or 52),
+                Position = UDim2.new(0, 16, 0.32, 0),
+                Corner = 14,
+                BackgroundTransparency = 0.05,
+                IconCorner = 8,
+                Transparency = 0,
+                Lockable = true,
+                LockHoldTime = 1.0,
+                Draggable = true,
+            })
+        end)
+        if ok and minimizer then
+            Gui.Minimizer = minimizer
+            pcall(function()
+                minimizer.Visible = true
+            end)
+            -- Встроенный клик сам зовёт Window:Minimize(), то есть открытие и
+            -- сворачивание уже работает. Здесь только держим кнопку на экране
+            -- и пишем состояние в лог.
+            task.spawn(function()
+                while Gui.Minimizer do
+                    task.wait(0.25)
+                    if Gui.MinimizerVisible ~= false and not minimizer.Visible then
+                        pcall(function()
+                            minimizer.Visible = true
+                        end)
+                    end
+                    local minimized = Window:IsMinimized()
+                    if Gui.MinimizerState ~= minimized then
+                        Gui.MinimizerState = minimized
+                        print("[StarHub] minimizer: window " .. (minimized and "hidden" or "shown"))
+                    end
+                end
+            end)
+        else
+            warn("[StarHub] minimizer failed: " .. tostring(minimizer))
+        end
+    end
+end
+
 -- Config system: remembers every widget so all settings can be saved and restored.
 do
     Gui.Widgets = {}
@@ -24413,6 +24493,15 @@ do
         "Интерфейс: <b>Fluent Modded</b>.<br />"
         .. "Хоткей окна: <b>RightShift</b>.<br />"
         .. "Конфиг хаба: <b>" .. tostring(ConfigFile) .. "</b>")
+    AboutBox:AddToggle("Menu Button", "Плавающая кнопка на экране: открыть и свернуть меню",
+        Gui.MinimizerVisible ~= false, function(value)
+        Gui.MinimizerVisible = value
+        if Gui.Minimizer then
+            pcall(function()
+                Gui.Minimizer.Visible = value
+            end)
+        end
+    end)
     AboutBox:AddActionRow("Minimize UI", "Hides the window - RightShift brings it back",
         StarHubUI.Icons.Minimize, function()
         pcall(function()
