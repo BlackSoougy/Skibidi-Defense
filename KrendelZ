@@ -19262,6 +19262,7 @@ Farm.SlenderRunning = false
 Farm.SlenderGen = 0
 Farm.SlenderFound = 0
 Farm.SlenderDone = 0
+Farm.SlenderContainer = nil
 Farm.SlenderMessage = "Idle"
 
 Farm.SlenderStop = function()
@@ -19345,54 +19346,123 @@ Farm.SlenderRun = function()
         return nil
     end
 
-    -- Контейнер с листовками: PlayerGui -> StarterGui.
-    local function pageContainer()
+    -- Контейнеры с листовками.
+    -- Листовки лежат в workspace.Slenderman и подписаны просто цифрами: "1".."12".
+    -- PlayerGui / StarterGui оставлены вторым источником: в части версий игры
+    -- те же листовки рисуются как интерфейс.
+    local function pageRoots()
         local roots = {}
-        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-        if playerGui then
-            roots[#roots + 1] = playerGui
-        end
-        local starterGui = game:GetService("StarterGui")
-        if starterGui then
-            roots[#roots + 1] = starterGui
-        end
-        for _, root in ipairs(roots) do
-            local direct = root:FindFirstChild("slenderman")
-            if direct then
-                return direct
+
+        local function add(node)
+            if node and not table.find(roots, node) then
+                roots[#roots + 1] = node
             end
-            for _, child in ipairs(root:GetChildren()) do
+        end
+
+        -- 1. workspace.Slenderman — сначала точное имя, потом без учёта регистра.
+        local direct = Workspace:FindFirstChild("Slenderman")
+        if not direct then
+            for _, child in ipairs(Workspace:GetChildren()) do
                 if string.lower(tostring(child.Name)) == "slenderman" then
-                    return child
+                    direct = child
+                    break
                 end
             end
         end
-        return nil
+        if direct then
+            add(direct)
+        end
+
+        -- 2. Папки в корне нет — ищем её на любой глубине карты.
+        if not direct then
+            local ok, deep = pcall(function()
+                return Workspace:FindFirstChild("Slenderman", true)
+            end)
+            if ok and deep then
+                add(deep)
+            end
+        end
+
+        -- 3. Интерфейс — запасной вариант.
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        if playerGui then
+            local node = playerGui:FindFirstChild("slenderman")
+            if not node then
+                for _, child in ipairs(playerGui:GetChildren()) do
+                    if string.lower(tostring(child.Name)) == "slenderman" then
+                        node = child
+                        break
+                    end
+                end
+            end
+            add(node)
+        end
+        local starterGui = game:GetService("StarterGui")
+        if starterGui then
+            add(starterGui:FindFirstChild("slenderman"))
+        end
+
+        return roots
     end
 
+    -- Ищем листовку по номеру. Порядок важен: сперва точное имя ("1"),
+    -- и только потом цифры внутри имени ("Page1"). Иначе "Map1" перебил бы
+    -- настоящую листовку "1". Последний проход — на уровень глубже, если
+    -- части лежат в подпапке вроде workspace.Slenderman.Pages.
     local function pageByNumber(container, number)
         local wanted = tostring(number)
-        for _, child in ipairs(container:GetChildren()) do
-            local name = tostring(child.Name)
-            if name == wanted then
-                return child
-            end
-            local digits = string.match(name, "(%d+)")
-            if digits and tonumber(digits) == number then
+        local children = container:GetChildren()
+
+        for _, child in ipairs(children) do
+            if tostring(child.Name) == wanted then
                 return child
             end
         end
+
+        local function digitMatch(node)
+            local digits = string.match(tostring(node.Name), "(%d+)")
+            return digits ~= nil and tonumber(digits) == number
+        end
+
+        for _, child in ipairs(children) do
+            if digitMatch(child) then
+                return child
+            end
+        end
+
+        for _, child in ipairs(children) do
+            local ok, grand = pcall(function()
+                return child:GetChildren()
+            end)
+            if ok and grand then
+                for _, node in ipairs(grand) do
+                    if tostring(node.Name) == wanted then
+                        return node
+                    end
+                end
+                for _, node in ipairs(grand) do
+                    if digitMatch(node) then
+                        return node
+                    end
+                end
+            end
+        end
+
         return nil
     end
 
     local function collectPages()
         local list = {}
-        local container = pageContainer()
-        if container then
+        Farm.SlenderContainer = nil
+        local roots = pageRoots()
+        for _, container in ipairs(roots) do
             for index = 1, 12 do
-                local object = pageByNumber(container, index)
-                if object then
-                    list[index] = object
+                if not list[index] then
+                    local object = pageByNumber(container, index)
+                    if object then
+                        list[index] = object
+                        Farm.SlenderContainer = container
+                    end
                 end
             end
         end
@@ -19405,9 +19475,14 @@ Farm.SlenderRun = function()
         end
         if missing then
             -- Запасной проход по миру: Page1..Page12 или просто 1..12.
+            -- Обход через Farm.SafeDescendants: GetDescendants() на большой карте
+            -- строит всю таблицу за один кадр и вешает клиент.
             local found = {}
-            pcall(function()
-                for _, object in ipairs(Workspace:GetDescendants()) do
+            local okScan, all = pcall(function()
+                return Farm.SafeDescendants(Workspace)
+            end)
+            if okScan and all then
+                for _, object in ipairs(all) do
                     local name = string.lower(tostring(object.Name))
                     local digits = string.match(name, "^pages?%s*(%d+)$")
                     if not digits then
@@ -19420,7 +19495,7 @@ Farm.SlenderRun = function()
                         end
                     end
                 end
-            end)
+            end
             for index = 1, 12 do
                 if not list[index] and found[index] then
                     list[index] = found[index]
@@ -19428,6 +19503,29 @@ Farm.SlenderRun = function()
             end
         end
         return list
+    end
+
+    -- Публичный скан для кнопки "Scan Pages" в меню: сколько листовок видно
+    -- и в каком контейнере они лежат. Возвращает total, путь, список номеров.
+    Farm.SlenderScan = function()
+        local pages = collectPages()
+        local total, names = 0, {}
+        for index = 1, 12 do
+            if pages[index] then
+                total = total + 1
+                names[#names + 1] = tostring(index)
+            end
+        end
+        Farm.SlenderFound = total
+        local container = Farm.SlenderContainer
+        local where = "не найдено"
+        if container then
+            local ok, path = pcall(function()
+                return container:GetFullName()
+            end)
+            where = ok and path or tostring(container.Name)
+        end
+        return total, where, names
     end
 
     local function firePrompt(prompt)
@@ -19506,6 +19604,19 @@ Farm.SlenderRun = function()
 
     task.spawn(function()
         local ok, err = pcall(function()
+            -- Уведомление на экран. Notify() объявлен ниже по файлу, поэтому
+            -- зовём библиотеку напрямую.
+            local function alert(title, content)
+                pcall(function()
+                    StarHubUI:Notify({
+                        Title = tostring(title),
+                        Content = tostring(content),
+                        Duration = 7,
+                        Icon = StarHubUI.Icons.Bell,
+                    })
+                end)
+            end
+
             local pages = collectPages()
             local total = 0
             for index = 1, 12 do
@@ -19514,7 +19625,17 @@ Farm.SlenderRun = function()
                 end
             end
             Farm.SlenderFound = total
-            say("pages found: " .. tostring(total) .. "/12")
+
+            local where = "не найдено"
+            if Farm.SlenderContainer then
+                local okPath, path = pcall(function()
+                    return Farm.SlenderContainer:GetFullName()
+                end)
+                if okPath and path then
+                    where = path
+                end
+            end
+            say("pages found: " .. tostring(total) .. "/12 | " .. where)
 
             if total > 0 then
                 Farm.SetNoclip(true)
@@ -19541,7 +19662,14 @@ Farm.SlenderRun = function()
                 Farm.SetNoclip(false)
                 say("pages done | noclip off")
             else
-                say("no pages found | going to the obby")
+                -- Папки workspace.Slenderman нет или в ней нет частей "1".."12".
+                -- Значит режим ещё не запущен: Offering item не активирован.
+                -- Дальше идти некуда — пещеры и босса без листовок нет.
+                say("no pages found | offering item not activated")
+                alert("Slender: Pages",
+                    "Листовки не найдены (workspace.Slenderman). "
+                    .. "Вы не активировали Offering item.")
+                return
             end
 
             if not alive() then
@@ -23468,9 +23596,22 @@ Gui.SlenderBox:AddSlider("Delay Cave -> Slenderman", 1, 20, State.SlenderCaveDel
 end)
 Gui.SlenderStatus = MakeInfoRow(Gui.SlenderBox, "Pages: 0/12", "Idle", StarHubUI.Icons.Save)
 Gui.SlenderBox:AddActionRow("Scan Pages", "Shows how many pages the walk found and where", StarHubUI.Icons.Search, function()
-    Notify("Slender", "found: " .. tostring(Farm.SlenderFound or 0) .. "/12 | taken: "
-        .. tostring(Farm.SlenderDone or 0) .. " | " .. tostring(Farm.SlenderMessage or "Idle"))
-    print("[Slender] " .. tostring(Farm.SlenderMessage or "Idle"))
+    task.spawn(function()
+        local total, where = 0, "не найдено"
+        if type(Farm.SlenderScan) == "function" then
+            local ok, a, b = pcall(Farm.SlenderScan)
+            if ok then
+                total = tonumber(a) or 0
+                where = tostring(b or where)
+            end
+        end
+        if total == 0 then
+            Notify("Slender: Pages", "Листовки не найдены. Вы не активировали Offering item.")
+        else
+            Notify("Slender: Pages", tostring(total) .. "/12 | " .. where)
+        end
+        print("[Slender] scan: " .. tostring(total) .. "/12 | " .. where)
+    end)
 end)
 Gui.SlenderBox:AddActionRow("Teleport To Cave", "Only the first half of the obby skip", StarHubUI.Icons.Teleport, function()
     local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
