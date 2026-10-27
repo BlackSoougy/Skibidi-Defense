@@ -1,3 +1,16 @@
+-- САМАЯ ПЕРВАЯ строка файла: отметка в логе.
+-- Стоит до любых GetService специально. Если файла StarHub_boot.log после
+-- запуска нет — значит скрипт вообще не дошёл до выполнения (не скомпилировался
+-- или обрезался при вставке в исполнитель), и искать надо не в коде ниже.
+do
+    pcall(function()
+        if writefile then
+            writefile("StarHub_boot.log",
+                "boot v2 @ " .. string.format("%.2f", os.clock()))
+        end
+    end)
+end
+
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -6,18 +19,6 @@ local PathfindingService = game:GetService("PathfindingService")
 local TeleportService = game:GetService("TeleportService")
 
 print("[StarHub] boot: local build (Fluent inlined)")
-
--- Ранняя отметка в логе. Если меню не появилось, по этой строке сразу видно,
--- что скрипт вообще запустился: иначе не отличить "упал до первого таба"
--- от "его не выполнили вовсе".
-do
-    pcall(function()
-        if writefile then
-            writefile("StarHub_boot.log",
-                "boot start @ " .. string.format("%.2f", os.clock()))
-        end
-    end)
-end
 
 local LocalPlayer = Players.LocalPlayer
 local Environment = getgenv()
@@ -768,42 +769,45 @@ end
 -- Кириллица в имя файла.
 -- string.gsub с %w работает по байтам и знает только ASCII, поэтому раньше
 -- "эндлес" превращался в "_" (каждая буква вырезалась), и макрос сохранялся
--- под именем "_" либо не создавался вовсе. Транслитерируем заранее.
-local CyrillicToLatin = {
-    [0x410] = "A", [0x411] = "B", [0x412] = "V", [0x413] = "G", [0x414] = "D",
-    [0x415] = "E", [0x401] = "E", [0x416] = "Zh", [0x417] = "Z", [0x418] = "I",
-    [0x419] = "Y", [0x41A] = "K", [0x41B] = "L", [0x41C] = "M", [0x41D] = "N",
-    [0x41E] = "O", [0x41F] = "P", [0x420] = "R", [0x421] = "S", [0x422] = "T",
-    [0x423] = "U", [0x424] = "F", [0x425] = "H", [0x426] = "C", [0x427] = "Ch",
-    [0x428] = "Sh", [0x429] = "Sch", [0x42A] = "", [0x42B] = "Y", [0x42C] = "",
-    [0x42D] = "E", [0x42E] = "Yu", [0x42F] = "Ya",
-    [0x430] = "a", [0x431] = "b", [0x432] = "v", [0x433] = "g", [0x434] = "d",
-    [0x435] = "e", [0x451] = "e", [0x436] = "zh", [0x437] = "z", [0x438] = "i",
-    [0x439] = "y", [0x43A] = "k", [0x43B] = "l", [0x43C] = "m", [0x43D] = "n",
-    [0x43E] = "o", [0x43F] = "p", [0x440] = "r", [0x441] = "s", [0x442] = "t",
-    [0x443] = "u", [0x444] = "f", [0x445] = "h", [0x446] = "c", [0x447] = "ch",
-    [0x448] = "sh", [0x449] = "sch", [0x44A] = "", [0x44B] = "y", [0x44C] = "",
-    [0x44D] = "e", [0x44E] = "yu", [0x44F] = "ya",
-}
-
-local function Transliterate(text)
-    if type(utf8) ~= "table" or type(utf8.codes) ~= "function" then
-        return text
-    end
-    local parts = {}
-    local ok = pcall(function()
-        for _, code in utf8.codes(text) do
-            parts[#parts + 1] = CyrillicToLatin[code] or utf8.char(code)
-        end
-    end)
-    if not ok then
-        return text
-    end
-    return table.concat(parts)
-end
-
+-- под именем "_" либо не создавался вовсе.
+-- Переводим по БАЙТАМ, без utf8: кириллица в UTF-8 это два байта,
+-- 0xD0/0xD1 плюс второй байт. Так не зависим от наличия utf8 в сандбоксе
+-- исполнителя и не тратим ещё одну локальную переменную верхнего уровня
+-- (в этом файле их и так под 195 при лимите Luau в 200).
 local function SanitizeName(name)
-    local text = Transliterate(tostring(name or ""))
+    local text = tostring(name or "")
+
+    -- Второй байт для блока 0xD0: А..п (заглавные, потом строчные).
+    local d0 = {
+        [0x81] = "E",
+        [0x90] = "A", [0x91] = "B", [0x92] = "V", [0x93] = "G", [0x94] = "D",
+        [0x95] = "E", [0x96] = "Zh", [0x97] = "Z", [0x98] = "I", [0x99] = "Y",
+        [0x9A] = "K", [0x9B] = "L", [0x9C] = "M", [0x9D] = "N", [0x9E] = "O",
+        [0x9F] = "P", [0xA0] = "R", [0xA1] = "S", [0xA2] = "T", [0xA3] = "U",
+        [0xA4] = "F", [0xA5] = "H", [0xA6] = "C", [0xA7] = "Ch", [0xA8] = "Sh",
+        [0xA9] = "Sch", [0xAA] = "", [0xAB] = "Y", [0xAC] = "", [0xAD] = "E",
+        [0xAE] = "Yu", [0xAF] = "Ya",
+        [0xB0] = "a", [0xB1] = "b", [0xB2] = "v", [0xB3] = "g", [0xB4] = "d",
+        [0xB5] = "e", [0xB6] = "zh", [0xB7] = "z", [0xB8] = "i", [0xB9] = "y",
+        [0xBA] = "k", [0xBB] = "l", [0xBC] = "m", [0xBD] = "n", [0xBE] = "o",
+        [0xBF] = "p",
+    }
+    -- Второй байт для блока 0xD1: р..я плюс ё.
+    local d1 = {
+        [0x80] = "r", [0x81] = "s", [0x82] = "t", [0x83] = "u", [0x84] = "f",
+        [0x85] = "h", [0x86] = "c", [0x87] = "ch", [0x88] = "sh", [0x89] = "sch",
+        [0x8A] = "", [0x8B] = "y", [0x8C] = "", [0x8D] = "e", [0x8E] = "yu",
+        [0x8F] = "ya", [0x91] = "e",
+    }
+
+    text = text:gsub("[\208\209][\128-\191]", function(pair)
+        local first, second = pair:byte(1), pair:byte(2)
+        if first == 208 then
+            return d0[second] or ""
+        end
+        return d1[second] or ""
+    end)
+
     text = text:gsub("[^%w%-%_]", "_")
     text = text:gsub("_+", "_")
     text = text:gsub("^_+", ""):gsub("_+$", "")
@@ -23113,9 +23117,11 @@ local MacrosTab = Window:CreateTab({
 -- поэтому тут не должно быть ничего, кроме самого дропдауна.
 local macroBox = MacrosTab:CreateGroupBox("Left", "Saved Macros", "LIST", StarHubUI.Icons.Search)
 
-local selectedMacro = nil
-local macroDropdown = nil
-
+-- Всё состояние макросов живёт в Gui, а не в отдельных local-переменных.
+-- Причина не стилистическая: у Luau жёсткий лимит локальных переменных на
+-- функцию (200 штук / 255 регистров), а главный чанк этого скрипта уже
+-- вплотную к нему подошёл. Каждая лишняя local-переменная здесь — риск
+-- получить "скрипт не скомпилировался" и полностью пустой экран.
 local newProfileName = Config.NewProfileName or ""
 
 local function StartEnabledPlayback()
@@ -23131,12 +23137,12 @@ local function StartEnabledPlayback()
 end
 Gui.StartEnabledPlayback = StartEnabledPlayback
 
-local function MacroCount()
+Gui.MacroCount = function()
     return #ListProfiles()
 end
 
-local function MacroInfoText()
-    local count = MacroCount()
+Gui.MacroInfoText = function()
+    local count = Gui.MacroCount()
     local parts = { tostring(count) .. " на диске" }
     if State.Recording then
         parts[#parts + 1] = "идёт запись"
@@ -23148,7 +23154,7 @@ local function MacroInfoText()
     return table.concat(parts, " · ")
 end
 
-local function RefreshMacroInfo()
+Gui.RefreshMacroInfo = function()
     if not Gui.MacroInfo then
         return
     end
@@ -23157,7 +23163,7 @@ local function RefreshMacroInfo()
         current = "—"
     end
     Gui.MacroInfo:SetTitle("Selected: " .. tostring(current))
-    Gui.MacroInfo:SetDesc(MacroInfoText())
+    Gui.MacroInfo:SetDesc(Gui.MacroInfoText())
 end
 
 local function RebuildProfiles(selectName)
@@ -23166,7 +23172,6 @@ local function RebuildProfiles(selectName)
             child:Destroy()
         end
     end
-    macroDropdown = nil
 
     local values = ListProfiles()
     local empty = #values == 0
@@ -23185,17 +23190,17 @@ local function RebuildProfiles(selectName)
     if empty then
         default = "(none)"
     end
-    selectedMacro = default
+    Gui.MacroSelected = default
 
-    macroDropdown = macroBox:AddDropdown("Select Macro", values, default, function(value)
+    macroBox:AddDropdown("Select Macro", values, default, function(value)
         if value == "(none)" or value == nil then
             return
         end
-        selectedMacro = value
+        Gui.MacroSelected = value
         local ok, message = LoadProfile(value)
         if ok then
             RefreshActionList()
-            RefreshMacroInfo()
+            Gui.RefreshMacroInfo()
             SetStatus("Loaded", string.format("%s (%d actions)", State.ProfileName, #State.Actions))
             QueueSave()
             task.defer(StartEnabledPlayback)
@@ -23204,7 +23209,7 @@ local function RebuildProfiles(selectName)
         end
     end)
 
-    RefreshMacroInfo()
+    Gui.RefreshMacroInfo()
 end
 
 -- Действия с макросами --------------------------------------------------------
@@ -23219,7 +23224,7 @@ end)
 -- Имя, которое сейчас реально набрано в поле.
 -- Callback инпута приходит только по Enter, а клик по кнопке его не рождает,
 -- поэтому за текстом ходим прямо в элемент (см. handle.GetLive).
-local function TypedName()
+Gui.MacroTypedName = function()
     if Gui.MacroNameInput then
         local ok, value = pcall(function()
             if type(Gui.MacroNameInput.GetLive) == "function" then
@@ -23236,21 +23241,22 @@ end
 
 -- Имя для сохранения: введённое в поле важнее выбранного в списке.
 -- Так поле работает ещё и как "Save As".
-local function TargetName()
-    local typed = TypedName()
+Gui.MacroTargetName = function()
+    local typed = Gui.MacroTypedName()
     if typed ~= "" then
         return typed
     end
-    return SanitizeName(selectedMacro or State.ProfileName or "")
+    return SanitizeName(Gui.MacroSelected or State.ProfileName or "")
 end
 
 -- Удаление в два нажатия: первое взводит, второе (в течение 6 секунд) удаляет.
 -- delfile необратим, случайное нажатие не должно убивать записанный макрос.
-local pendingDelete = nil
-local pendingDeleteAt = 0
+-- Состояние лежит в Gui — по той же причине, что и остальное выше.
+Gui.MacroPendingDelete = nil
+Gui.MacroPendingDeleteAt = 0
 
 LibraryBox:AddActionRow("Create Macro", "Creates an empty macro and selects it", StarHubUI.Icons.Save, function()
-    local name = TypedName()
+    local name = Gui.MacroTypedName()
     if name == "" then
         Notify("Create Macro", "Сначала впиши имя макроса")
         return
@@ -23288,7 +23294,7 @@ LibraryBox:AddActionRow("Create Macro", "Creates an empty macro and selects it",
 end)
 
 LibraryBox:AddActionRow("Save Macro", "Writes the actions in memory to the macro file", StarHubUI.Icons.Save, function()
-    local name = TargetName()
+    local name = Gui.MacroTargetName()
     if name == "" then
         Notify("Save Macro", "Выбери макрос или впиши имя")
         return
@@ -23314,7 +23320,7 @@ LibraryBox:AddActionRow("Save Macro", "Writes the actions in memory to the macro
 end)
 
 LibraryBox:AddActionRow("Delete Macro", "Click twice to remove the selected macro file", StarHubUI.Icons.Skull, function()
-    local name = SanitizeName(selectedMacro or "")
+    local name = SanitizeName(Gui.MacroSelected or "")
     if name == "" or name == "(none)" then
         Notify("Delete Macro", "Выбери макрос в списке")
         return
@@ -23334,14 +23340,14 @@ LibraryBox:AddActionRow("Delete Macro", "Click twice to remove the selected macr
     end
 
     local now = os.clock()
-    if pendingDelete ~= name or (now - pendingDeleteAt) > 6 then
-        pendingDelete = name
-        pendingDeleteAt = now
+    if Gui.MacroPendingDelete ~= name or (now - Gui.MacroPendingDeleteAt) > 6 then
+        Gui.MacroPendingDelete = name
+        Gui.MacroPendingDeleteAt = now
         Notify("Delete Macro", "Нажми ещё раз в течение 6 секунд, чтобы удалить «" .. name .. "»")
         SetStatus("Confirm delete", name)
         return
     end
-    pendingDelete = nil
+    Gui.MacroPendingDelete = nil
 
     local ok, err = pcall(delfile, ProfilePath(name))
     if not ok then
@@ -23357,7 +23363,7 @@ LibraryBox:AddActionRow("Delete Macro", "Click twice to remove the selected macr
         State.Actions = {}
         RefreshActionList()
     end
-    if TypedName() == name or SanitizeName(newProfileName or "") == name then
+    if Gui.MacroTypedName() == name or SanitizeName(newProfileName or "") == name then
         newProfileName = ""
         Config.NewProfileName = ""
         if Gui.MacroNameInput and Gui.MacroNameInput.Set then
@@ -23374,9 +23380,9 @@ LibraryBox:AddActionRow("Delete Macro", "Click twice to remove the selected macr
 end)
 
 LibraryBox:AddActionRow("Refresh List", "Rescans the macros folder on disk", StarHubUI.Icons.Refresh, function()
-    pendingDelete = nil
-    RebuildProfiles(selectedMacro or State.ProfileName)
-    local count = MacroCount()
+    Gui.MacroPendingDelete = nil
+    RebuildProfiles(Gui.MacroSelected or State.ProfileName)
+    local count = Gui.MacroCount()
     Notify("Macros", "Список обновлён · " .. tostring(count) .. " шт.")
     SetStatus("Refreshed", tostring(count) .. " macros")
 end)
@@ -25649,7 +25655,11 @@ Hub.LoadProfile = LoadProfile
 Hub.ListProfiles = ListProfiles
 Hub.SetSpeed = ApplySpeed
 
-_G.SkibidiDefenseHubDestroy = Hub.Destroy
+-- _G в песочнице исполнителя бывает защищён от записи. Без pcall эта строка
+-- рвёт всю инициализацию ниже: config-boot, авто-чистку карты, сохранение.
+pcall(function()
+    _G.SkibidiDefenseHubDestroy = Hub.Destroy
+end)
 
 if Hub.Config then
     Gui.Step("post:config-boot")
