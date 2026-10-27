@@ -765,10 +765,49 @@ local function SendMatchEndWebhook()
     end)
 end
 
+-- Кириллица в имя файла.
+-- string.gsub с %w работает по байтам и знает только ASCII, поэтому раньше
+-- "эндлес" превращался в "_" (каждая буква вырезалась), и макрос сохранялся
+-- под именем "_" либо не создавался вовсе. Транслитерируем заранее.
+local CyrillicToLatin = {
+    [0x410] = "A", [0x411] = "B", [0x412] = "V", [0x413] = "G", [0x414] = "D",
+    [0x415] = "E", [0x401] = "E", [0x416] = "Zh", [0x417] = "Z", [0x418] = "I",
+    [0x419] = "Y", [0x41A] = "K", [0x41B] = "L", [0x41C] = "M", [0x41D] = "N",
+    [0x41E] = "O", [0x41F] = "P", [0x420] = "R", [0x421] = "S", [0x422] = "T",
+    [0x423] = "U", [0x424] = "F", [0x425] = "H", [0x426] = "C", [0x427] = "Ch",
+    [0x428] = "Sh", [0x429] = "Sch", [0x42A] = "", [0x42B] = "Y", [0x42C] = "",
+    [0x42D] = "E", [0x42E] = "Yu", [0x42F] = "Ya",
+    [0x430] = "a", [0x431] = "b", [0x432] = "v", [0x433] = "g", [0x434] = "d",
+    [0x435] = "e", [0x451] = "e", [0x436] = "zh", [0x437] = "z", [0x438] = "i",
+    [0x439] = "y", [0x43A] = "k", [0x43B] = "l", [0x43C] = "m", [0x43D] = "n",
+    [0x43E] = "o", [0x43F] = "p", [0x440] = "r", [0x441] = "s", [0x442] = "t",
+    [0x443] = "u", [0x444] = "f", [0x445] = "h", [0x446] = "c", [0x447] = "ch",
+    [0x448] = "sh", [0x449] = "sch", [0x44A] = "", [0x44B] = "y", [0x44C] = "",
+    [0x44D] = "e", [0x44E] = "yu", [0x44F] = "ya",
+}
+
+local function Transliterate(text)
+    if type(utf8) ~= "table" or type(utf8.codes) ~= "function" then
+        return text
+    end
+    local parts = {}
+    local ok = pcall(function()
+        for _, code in utf8.codes(text) do
+            parts[#parts + 1] = CyrillicToLatin[code] or utf8.char(code)
+        end
+    end)
+    if not ok then
+        return text
+    end
+    return table.concat(parts)
+end
+
 local function SanitizeName(name)
-    name = tostring(name or ""):gsub("[^%w%-%_]", "_")
-    name = name:gsub("_+", "_")
-    return name:sub(1, 48)
+    local text = Transliterate(tostring(name or ""))
+    text = text:gsub("[^%w%-%_]", "_")
+    text = text:gsub("_+", "_")
+    text = text:gsub("^_+", ""):gsub("_+$", "")
+    return text:sub(1, 48)
 end
 
 local function CFrameToArray(value)
@@ -15696,6 +15735,45 @@ do local ab,ac,ad,ae,af,ag,ah,aj,c,e,f,g,h,i,j,k=task,setmetatable,error,newprox
                     element:SetValue(state)
                 end)
             end)
+            -- Живое значение из настоящего TextBox.
+            -- При Finished = true Fluent зовёт Callback ТОЛЬКО по Enter:
+            -- в Input.New на FocusLost стоит `if not l then return end`.
+            -- Клик по кнопке рядом фокус не снимает, поэтому state остаётся
+            -- пустым и код видит пустое поле. Держим состояние в актуальном
+            -- виде прямо с TextBox, callback при этом не трогаем.
+            local liveBox = nil
+            local function FindLiveBox()
+                if liveBox then
+                    return liveBox
+                end
+                pcall(function()
+                    liveBox = element.Frame:FindFirstChildWhichIsA("TextBox", true)
+                end)
+                return liveBox
+            end
+            if FindLiveBox() then
+                pcall(function()
+                    liveBox:GetPropertyChangedSignal("Text"):Connect(function()
+                        if handle._busy then
+                            return
+                        end
+                        state = tostring(liveBox.Text or "")
+                    end)
+                end)
+            end
+            handle.GetLive = function()
+                local box = FindLiveBox()
+                if box then
+                    local ok, text = pcall(function()
+                        return tostring(box.Text or "")
+                    end)
+                    if ok and text ~= nil then
+                        state = text
+                        return text
+                    end
+                end
+                return state
+            end
             -- Старый код читает и пишет handle.Text напрямую.
             return setmetatable(handle, {
                 __index = function(_, key)
@@ -23138,10 +23216,28 @@ Gui.MacroNameInput = LibraryBox:AddInput("Macro Name", "example: map1_solo", new
     QueueSave()
 end)
 
+-- Имя, которое сейчас реально набрано в поле.
+-- Callback инпута приходит только по Enter, а клик по кнопке его не рождает,
+-- поэтому за текстом ходим прямо в элемент (см. handle.GetLive).
+local function TypedName()
+    if Gui.MacroNameInput then
+        local ok, value = pcall(function()
+            if type(Gui.MacroNameInput.GetLive) == "function" then
+                return Gui.MacroNameInput.GetLive()
+            end
+            return Gui.MacroNameInput.Get()
+        end)
+        if ok and type(value) == "string" then
+            return SanitizeName(value)
+        end
+    end
+    return SanitizeName(newProfileName or "")
+end
+
 -- Имя для сохранения: введённое в поле важнее выбранного в списке.
 -- Так поле работает ещё и как "Save As".
 local function TargetName()
-    local typed = SanitizeName(newProfileName or "")
+    local typed = TypedName()
     if typed ~= "" then
         return typed
     end
@@ -23154,7 +23250,7 @@ local pendingDelete = nil
 local pendingDeleteAt = 0
 
 LibraryBox:AddActionRow("Create Macro", "Creates an empty macro and selects it", StarHubUI.Icons.Save, function()
-    local name = SanitizeName(newProfileName or "")
+    local name = TypedName()
     if name == "" then
         Notify("Create Macro", "Сначала впиши имя макроса")
         return
@@ -23177,6 +23273,15 @@ LibraryBox:AddActionRow("Create Macro", "Creates an empty macro and selects it",
     end
     RefreshActionList()
     RebuildProfiles(name)
+    -- Показываем в поле итоговое имя файла: "эндлес" превращается в "endles",
+    -- и человек должен видеть, под каким именем макрос реально лёг на диск.
+    newProfileName = name
+    Config.NewProfileName = name
+    if Gui.MacroNameInput and Gui.MacroNameInput.Set then
+        pcall(function()
+            Gui.MacroNameInput:Set(name)
+        end)
+    end
     SetStatus("Created", name .. " is ready to record")
     Notify("Create Macro", "«" .. name .. "» создан")
     QueueSave()
@@ -23252,7 +23357,7 @@ LibraryBox:AddActionRow("Delete Macro", "Click twice to remove the selected macr
         State.Actions = {}
         RefreshActionList()
     end
-    if newProfileName == name then
+    if TypedName() == name or SanitizeName(newProfileName or "") == name then
         newProfileName = ""
         Config.NewProfileName = ""
         if Gui.MacroNameInput and Gui.MacroNameInput.Set then
