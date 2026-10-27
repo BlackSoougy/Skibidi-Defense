@@ -23029,18 +23029,16 @@ local MacrosTab = Window:CreateTab({
     LayoutOrder = 4,
 })
 
-local LibraryBox = MacrosTab:CreateGroupBox("Left", "Macro Library", "REC", StarHubUI.Icons.Save)
+-- Список макросов на диске ----------------------------------------------------
+-- Отдельная коробка только под выпадающий список: при обновлении её содержимое
+-- пересоздаётся целиком (Fluent не умеет менять Values у живого дропдауна),
+-- поэтому тут не должно быть ничего, кроме самого дропдауна.
+local macroBox = MacrosTab:CreateGroupBox("Left", "Saved Macros", "LIST", StarHubUI.Icons.Search)
+
+local selectedMacro = nil
+local macroDropdown = nil
 
 local newProfileName = Config.NewProfileName or ""
-LibraryBox:AddInput("Create Macro", "example: map1_solo", newProfileName, function(value)
-    newProfileName = SanitizeName(value)
-    Config.NewProfileName = newProfileName
-    QueueSave()
-end)
-
-local profileValues = ListProfiles()
-if #profileValues == 0 then profileValues = { "(none)" } end
-local selectedDefault = State.ProfileName ~= "" and State.ProfileName or profileValues[1]
 
 local function StartEnabledPlayback()
     if not State.PlaybackEnabled or State.Playing or State.Recording or #State.Actions == 0 then
@@ -23055,14 +23053,118 @@ local function StartEnabledPlayback()
 end
 Gui.StartEnabledPlayback = StartEnabledPlayback
 
-LibraryBox:AddActionRow("Create New Macro", "Registers an empty profile ready for recording", StarHubUI.Icons.Save, function()
-    local name = SanitizeName(newProfileName)
+local function MacroCount()
+    return #ListProfiles()
+end
+
+local function MacroInfoText()
+    local count = MacroCount()
+    local parts = { tostring(count) .. " на диске" }
+    if State.Recording then
+        parts[#parts + 1] = "идёт запись"
+    end
+    if State.Playing then
+        parts[#parts + 1] = "идёт проигрывание"
+    end
+    parts[#parts + 1] = tostring(#State.Actions) .. " действий в памяти"
+    return table.concat(parts, " · ")
+end
+
+local function RefreshMacroInfo()
+    if not Gui.MacroInfo then
+        return
+    end
+    local current = State.ProfileName
+    if current == nil or current == "" then
+        current = "—"
+    end
+    Gui.MacroInfo:SetTitle("Selected: " .. tostring(current))
+    Gui.MacroInfo:SetDesc(MacroInfoText())
+end
+
+local function RebuildProfiles(selectName)
+    for _, child in ipairs(macroBox.Container:GetChildren()) do
+        if child:IsA("GuiObject") then
+            child:Destroy()
+        end
+    end
+    macroDropdown = nil
+
+    local values = ListProfiles()
+    local empty = #values == 0
+    if empty then
+        values = { "(none)" }
+    end
+
+    local default = selectName
+    if not default or default == "" or not table.find(values, default) then
+        if not empty and State.ProfileName ~= "" and table.find(values, State.ProfileName) then
+            default = State.ProfileName
+        else
+            default = values[1]
+        end
+    end
+    if empty then
+        default = "(none)"
+    end
+    selectedMacro = default
+
+    macroDropdown = macroBox:AddDropdown("Select Macro", values, default, function(value)
+        if value == "(none)" or value == nil then
+            return
+        end
+        selectedMacro = value
+        local ok, message = LoadProfile(value)
+        if ok then
+            RefreshActionList()
+            RefreshMacroInfo()
+            SetStatus("Loaded", string.format("%s (%d actions)", State.ProfileName, #State.Actions))
+            QueueSave()
+            task.defer(StartEnabledPlayback)
+        else
+            SetStatus("Load failed", tostring(message))
+        end
+    end)
+
+    RefreshMacroInfo()
+end
+
+-- Действия с макросами --------------------------------------------------------
+local LibraryBox = MacrosTab:CreateGroupBox("Left", "Macro Actions", "MANAGE", StarHubUI.Icons.Save)
+
+Gui.MacroNameInput = LibraryBox:AddInput("Macro Name", "example: map1_solo", newProfileName, function(value)
+    newProfileName = SanitizeName(value)
+    Config.NewProfileName = newProfileName
+    QueueSave()
+end)
+
+-- Имя для сохранения: введённое в поле важнее выбранного в списке.
+-- Так поле работает ещё и как "Save As".
+local function TargetName()
+    local typed = SanitizeName(newProfileName or "")
+    if typed ~= "" then
+        return typed
+    end
+    return SanitizeName(selectedMacro or State.ProfileName or "")
+end
+
+-- Удаление в два нажатия: первое взводит, второе (в течение 6 секунд) удаляет.
+-- delfile необратим, случайное нажатие не должно убивать записанный макрос.
+local pendingDelete = nil
+local pendingDeleteAt = 0
+
+LibraryBox:AddActionRow("Create Macro", "Creates an empty macro and selects it", StarHubUI.Icons.Save, function()
+    local name = SanitizeName(newProfileName or "")
     if name == "" then
-        Notify("Create Macro", "Enter a macro name first")
+        Notify("Create Macro", "Сначала впиши имя макроса")
         return
     end
     if HasFilesystem and isfile(ProfilePath(name)) then
-        Notify("Create Macro", "That macro already exists")
+        Notify("Create Macro", "«" .. name .. "» уже существует")
+        return
+    end
+    if State.Recording then
+        Notify("Create Macro", "Сначала останови запись")
         return
     end
     local previousActions, previousName = State.Actions, State.ProfileName
@@ -23073,43 +23175,110 @@ LibraryBox:AddActionRow("Create New Macro", "Registers an empty profile ready fo
         Notify("Create failed", tostring(message))
         return
     end
-    if Gui.RefreshProfiles then Gui.RefreshProfiles(name) end
     RefreshActionList()
+    RebuildProfiles(name)
     SetStatus("Created", name .. " is ready to record")
+    Notify("Create Macro", "«" .. name .. "» создан")
     QueueSave()
 end)
 
-local macroBox = MacrosTab:CreateGroupBox("Left", "Profile Load", nil, StarHubUI.Icons.Save)
+LibraryBox:AddActionRow("Save Macro", "Writes the actions in memory to the macro file", StarHubUI.Icons.Save, function()
+    local name = TargetName()
+    if name == "" then
+        Notify("Save Macro", "Выбери макрос или впиши имя")
+        return
+    end
+    if #State.Actions == 0 then
+        Notify("Save Macro", "Нечего сохранять — сначала запиши действия")
+        return
+    end
+    if State.Recording then
+        Notify("Save Macro", "Идёт запись — выключи Record, он сохранит сам")
+        return
+    end
+    local ok, message = SaveProfile(name)
+    if not ok then
+        Notify("Save failed", tostring(message))
+        return
+    end
+    RefreshActionList()
+    RebuildProfiles(name)
+    SetStatus("Saved", string.format("%s (%d actions)", name, #State.Actions))
+    Notify("Save Macro", string.format("«%s» · %d действий", name, #State.Actions))
+    QueueSave()
+end)
 
-local function RebuildProfiles(selectName)
-    for _, child in ipairs(macroBox.Container:GetChildren()) do
-        if child:IsA("GuiObject") then
-            child:Destroy()
+LibraryBox:AddActionRow("Delete Macro", "Click twice to remove the selected macro file", StarHubUI.Icons.Skull, function()
+    local name = SanitizeName(selectedMacro or "")
+    if name == "" or name == "(none)" then
+        Notify("Delete Macro", "Выбери макрос в списке")
+        return
+    end
+    if State.Recording and State.ProfileName == name then
+        Notify("Delete Macro", "В этот макрос идёт запись — останови её")
+        return
+    end
+    if type(delfile) ~= "function" then
+        Notify("Delete Macro", "Executor не поддерживает delfile")
+        return
+    end
+    if not (HasFilesystem and isfile(ProfilePath(name))) then
+        Notify("Delete Macro", "Файл «" .. name .. "» не найден")
+        RebuildProfiles()
+        return
+    end
+
+    local now = os.clock()
+    if pendingDelete ~= name or (now - pendingDeleteAt) > 6 then
+        pendingDelete = name
+        pendingDeleteAt = now
+        Notify("Delete Macro", "Нажми ещё раз в течение 6 секунд, чтобы удалить «" .. name .. "»")
+        SetStatus("Confirm delete", name)
+        return
+    end
+    pendingDelete = nil
+
+    local ok, err = pcall(delfile, ProfilePath(name))
+    if not ok then
+        Notify("Delete failed", tostring(err))
+        return
+    end
+
+    -- Если удалили загруженный макрос — память тоже чистим,
+    -- иначе Save вернёт его обратно на диск.
+    if State.ProfileName == name then
+        State.ProfileName = ""
+        State.ProfileVersion = 0
+        State.Actions = {}
+        RefreshActionList()
+    end
+    if newProfileName == name then
+        newProfileName = ""
+        Config.NewProfileName = ""
+        if Gui.MacroNameInput and Gui.MacroNameInput.Set then
+            pcall(function()
+                Gui.MacroNameInput:Set("")
+            end)
         end
     end
 
-    local values = ListProfiles()
-    if #values == 0 then values = { "(none)" } end
-    local default = selectName
-    if not default or default == "" or not table.find(values, default) then
-        default = values[1]
-    end
+    RebuildProfiles()
+    SetStatus("Deleted", name)
+    Notify("Delete Macro", "«" .. name .. "» удалён")
+    QueueSave()
+end)
 
-    macroBox:AddDropdown("Select Macro", values, default, function(value)
-        if value == "(none)" then return end
-        local ok, message = LoadProfile(value)
-        if ok then
-            RefreshActionList()
-            SetStatus("Loaded", string.format("%s (%d actions)", State.ProfileName, #State.Actions))
-            QueueSave()
-            task.defer(StartEnabledPlayback)
-        else
-            SetStatus("Load failed", tostring(message))
-        end
-    end)
-end
+LibraryBox:AddActionRow("Refresh List", "Rescans the macros folder on disk", StarHubUI.Icons.Refresh, function()
+    pendingDelete = nil
+    RebuildProfiles(selectedMacro or State.ProfileName)
+    local count = MacroCount()
+    Notify("Macros", "Список обновлён · " .. tostring(count) .. " шт.")
+    SetStatus("Refreshed", tostring(count) .. " macros")
+end)
 
-RebuildProfiles(selectedDefault)
+Gui.MacroInfo = MakeInfoRow(LibraryBox, "Selected: —", "0 на диске", StarHubUI.Icons.Info)
+
+RebuildProfiles(State.ProfileName ~= "" and State.ProfileName or nil)
 Gui.RefreshProfiles = RebuildProfiles
 
 local StatusBox = MacrosTab:CreateGroupBox("Right", "Live Status", "STATE", StarHubUI.Icons.Zap)
