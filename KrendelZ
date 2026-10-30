@@ -20292,6 +20292,28 @@ do
     }
 
     local VimService = nil
+    local VirtualUserService = nil
+    local ClickServices = {}
+
+    -- На телефоне мышиные события VirtualInputManager ничего не делают:
+    -- тач идёт другим путём. Поэтому платформу надо знать заранее, а не
+    -- выяснять по факту "клик прошёл или нет".
+    local IsTouchOnly = false
+    pcall(function()
+        local uis = game:GetService("UserInputService")
+        IsTouchOnly = (uis.TouchEnabled and not uis.KeyboardEnabled) and true or false
+    end)
+
+    local function ClickService(name)
+        if ClickServices[name] ~= nil then
+            return ClickServices[name] or nil
+        end
+        local ok, service = pcall(function()
+            return game:GetService(name)
+        end)
+        ClickServices[name] = (ok and service) or false
+        return ClickServices[name] or nil
+    end
 
     local function Report(text)
         Crates.Status = tostring(text)
@@ -20356,30 +20378,48 @@ do
         return okSize and usable
     end
 
-    -- Existing connections first (they prove the handler exists), then
-    -- firesignal, then a synthetic mouse click at the button centre.
+    -- Порядок важен. Сначала то, что не зависит от платформы, и только
+    -- потом мышиные события. Иначе на телефоне всё встаёт на первом же
+    -- шаге и автоскип молча ничего не делает.
     function Crates.Click(button)
         if not button then
             return false, "no button"
         end
+
+        -- 1. Обработчики напрямую. У RBXScriptConnection НЕТ метода :Fire(),
+        --    поэтому старый connection:Fire() всегда падал в pcall, fired
+        --    оставался нулём, и код уходил на мышиный путь. Вызывать надо
+        --    connection.Function - это работает и на ПК, и на телефоне.
+        --    Берём ТОЛЬКО первый сигнал, у которого есть обработчики: если
+        --    прожать все три подряд, кнопка получит 2-3 вызова за тик и
+        --    награда может сработать дважды.
         if type(getconnections) == "function" then
-            local ok, connections = pcall(getconnections, button.MouseButton1Click)
-            if ok and type(connections) == "table" and #connections > 0 then
-                local fired = 0
-                for _, connection in ipairs(connections) do
-                    local done = pcall(function()
-                        connection:Fire()
-                    end)
-                    if done then
-                        fired = fired + 1
+            for _, signalName in ipairs({ "MouseButton1Click", "Activated", "MouseButton1Down" }) do
+                local okSignal, signal = pcall(function()
+                    return button[signalName]
+                end)
+                if okSignal and signal then
+                    local ok, connections = pcall(getconnections, signal)
+                    if ok and type(connections) == "table" and #connections > 0 then
+                        local fired = 0
+                        for _, connection in ipairs(connections) do
+                            local handler = connection.Function or connection.func
+                            if type(handler) == "function" then
+                                if pcall(handler) then
+                                    fired = fired + 1
+                                end
+                            end
+                        end
+                        if fired > 0 then
+                            Crates.LastClickMethod = "connection:" .. signalName
+                            return true, Crates.LastClickMethod
+                        end
                     end
-                end
-                if fired > 0 then
-                    Crates.LastClickMethod = "connection"
-                    return true, Crates.LastClickMethod
                 end
             end
         end
+
+        -- 2. firesignal. Есть не во всех исполнителях, на мобильных часто нет.
         if type(firesignal) == "function" then
             local ok = pcall(firesignal, button.MouseButton1Click)
             if ok then
@@ -20387,32 +20427,50 @@ do
                 return true, Crates.LastClickMethod
             end
         end
-        if not VimService then
-            local ok, service = pcall(function()
-                return game:GetService("VirtualInputManager")
+
+        -- 3. VirtualUser:ClickButton1 - настоящий клик, который принимает и
+        --    тач-экран, и мышь. Это основной путь для телефона.
+        VirtualUserService = VirtualUserService or ClickService("VirtualUser")
+        if VirtualUserService then
+            local okPosition, position, size = pcall(function()
+                return button.AbsolutePosition, button.AbsoluteSize
             end)
-            if ok then
-                VimService = service
-            end
-        end
-        if VimService then
-            local ok = pcall(function()
-                local position = button.AbsolutePosition
-                local size = button.AbsoluteSize
-                local x = position.X + size.X / 2
-                local y = position.Y + size.Y / 2
-                pcall(function()
-                    VimService:SendMouseMoveEvent(x, y, game)
+            if okPosition and position and size then
+                local center = Vector2.new(position.X + size.X / 2, position.Y + size.Y / 2)
+                local ok = pcall(function()
+                    VirtualUserService:ClickButton1(center)
                 end)
-                VimService:SendMouseButtonEvent(x, y, 0, true, game, 1)
-                task.wait(0.02)
-                VimService:SendMouseButtonEvent(x, y, 0, false, game, 1)
-            end)
-            if ok then
-                Crates.LastClickMethod = "virtual"
-                return true, Crates.LastClickMethod
+                if ok then
+                    Crates.LastClickMethod = "virtualuser"
+                    return true, Crates.LastClickMethod
+                end
             end
         end
+
+        -- 4. VirtualInputManager - только ПК. На тач-экране эти события
+        --    игнорируются, поэтому туда даже не заходим.
+        if not IsTouchOnly then
+            VimService = VimService or ClickService("VirtualInputManager")
+            if VimService then
+                local ok = pcall(function()
+                    local position = button.AbsolutePosition
+                    local size = button.AbsoluteSize
+                    local x = position.X + size.X / 2
+                    local y = position.Y + size.Y / 2
+                    pcall(function()
+                        VimService:SendMouseMoveEvent(x, y, game)
+                    end)
+                    VimService:SendMouseButtonEvent(x, y, 0, true, game, 1)
+                    task.wait(0.02)
+                    VimService:SendMouseButtonEvent(x, y, 0, false, game, 1)
+                end)
+                if ok then
+                    Crates.LastClickMethod = "virtual"
+                    return true, Crates.LastClickMethod
+                end
+            end
+        end
+
         return false, "no click method"
     end
 
@@ -21089,6 +21147,13 @@ do
             return false
         end
         local lower = string.lower(name)
+        -- Волновой скип (PlayerGui.skipWave) к наградам отношения не имеет.
+        -- Раньше он подходил под правило "начинается на skip", и как только
+        -- клик начал реально срабатывать, автоскип наград заодно скипал
+        -- волны в матче. Исключаем его по имени.
+        if string.find(lower, "wave", 1, true) then
+            return false
+        end
         if string.find(lower, "skip", 1, true) ~= 1 then
             return false
         end
@@ -21098,6 +21163,12 @@ do
         return true
     end
 
+    -- Ветку волнового скипа не обходим вообще: даже если внутри лежит кнопка
+    -- с подходящим именем, это голосование за пропуск волны, а не награда.
+    local function IsWaveBranch(name)
+        return string.find(string.lower(tostring(name or "")), "wave", 1, true) ~= nil
+    end
+
     -- Only visible branches are walked: most of PlayerGui is hidden panels, and
     -- pruning them is what keeps a 20x/second scan cheap.
     local function Collect(node, found, depth)
@@ -21105,7 +21176,9 @@ do
             return
         end
         for _, child in ipairs(node:GetChildren()) do
-            if child:IsA("GuiObject") then
+            if IsWaveBranch(child.Name) then
+                -- пропускаем целиком, вместе с потомками
+            elseif child:IsA("GuiObject") then
                 if child.Visible then
                     if child:IsA("GuiButton") and Skip.Matches(child.Name) then
                         table.insert(found, child)
