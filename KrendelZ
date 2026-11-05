@@ -133,6 +133,8 @@ local State = {
     CrateAutoRefresh = true,
     CrateRefreshSeconds = 10,
     SkipBattlePass = false,
+    AutoTrade = false,
+    TradeConfirmTimeout = 5,
     AutoLoad = false,
     AutoLoadSource = "",
     AutoLoadDelay = 2,
@@ -19283,10 +19285,16 @@ function Farm.StopDoor()
     pcall(function()
         Farm.SetInstant(false)
     end)
-    -- Фарм выключили - возвращаем камере её обычный угол.
+    -- Фарм выключили - возвращаем камере угол из настроек, а не базовый.
+    -- Раньше здесь стоял безусловный reset(), и он затирал FOV из конфига:
+    -- после остановки двери обзор падал на 70, хотя в конфиге стояло 200.
     pcall(function()
         if Hub.Fov then
-            Hub.Fov.reset()
+            if State.FovEnabled then
+                Hub.Fov.setEnabled(true, State.FovValue)
+            else
+                Hub.Fov.reset()
+            end
         end
     end)
     FarmReportFor("door", "door farm stopped")
@@ -21109,6 +21117,470 @@ do
 end
 
 
+-- Auto trade (Trading Plaza) ----------------------------------------------------
+-- В игре площадь называется просто TRADE, а не Trading Plaza. Кнопка живёт в
+-- PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Side.Trade, после неё вылезает
+-- окно подтверждения с кнопкой Teleport. Точные пути, снятые с экрана:
+--   Main.Frame.Layout.ShardGamba.Frame.Side.Trade
+--   TradeGoVerify.Result.Teleport
+--   eventGoVerify.Result.Teleport
+-- Жмём ровно их и ничего больше: чужой Teleport (Tutorial и прочие окна) не
+-- трогаем, иначе можно уехать не туда. Клик идёт через Hub.Crates.Click - это
+-- единственный путь, который работает и на ПК, и на телефоне.
+do
+    local Trade = {
+        Status = "idle",
+        Enters = 0,
+        Confirms = 0,
+        Attempts = 0,
+        LastPath = "",
+        LastAt = 0,
+        Token = 0,
+        Running = false,
+        Listener = nil,
+        Cadence = 0.15,
+        -- Side.Trade - это ФРЕЙМ (UICorner + UIListLayout + UIStroke), а сам
+        -- клик висит на TextButton внутри него. Жмём сразу TextButton, фрейм
+        -- оставляем запасным путём.
+        ButtonPath = "PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Side.Trade.TextButton",
+        ButtonFrame = "PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Side.Trade",
+        ConfirmPaths = {
+            "PlayerGui.TradeGoVerify.Result.Teleport",
+            "PlayerGui.eventGoVerify.Result.Teleport",
+        },
+        -- Если панель пересоберут - ищем кнопку по имени рядом с ShardGamba.
+        ButtonParents = {
+            "PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Side",
+            "PlayerGui.Main.Frame.Layout.ShardGamba.Frame",
+            "PlayerGui.Main.Frame.Layout.ShardGamba",
+        },
+        -- Запасные окна подтверждения: та же кнопка, другие обёртки.
+        ConfirmFallback = {
+            "PlayerGui.MDTDTeleport.Frame.Teleport",
+            "PlayerGui.RNGoVerify.Result.Teleport",
+            "PlayerGui.Senario.Result.Teleport",
+        },
+    }
+
+    local function Report(text)
+        Trade.Status = tostring(text)
+        if type(Trade.Listener) == "function" then
+            pcall(Trade.Listener, Trade.Status)
+        end
+    end
+
+    local function PlayerGui()
+        local player = Players.LocalPlayer
+        if not player then
+            return nil
+        end
+        return player:FindFirstChild("PlayerGui")
+    end
+
+    local function FullName(obj)
+        local ok, name = pcall(function()
+            return obj:GetFullName()
+        end)
+        if ok then
+            return tostring(name)
+        end
+        return tostring(obj and obj.Name or "?")
+    end
+
+    -- Ребёнок по имени без учёта регистра: игра иногда переименовывает узлы
+    -- (Side -> side, Trade -> trade), и FindFirstChild тогда молча отдаёт nil.
+    local function ChildNamed(node, name)
+        if not node then
+            return nil
+        end
+        local exact = node:FindFirstChild(name)
+        if exact then
+            return exact
+        end
+        local wanted = string.lower(tostring(name))
+        for _, child in ipairs(node:GetChildren()) do
+            if string.lower(tostring(child.Name)) == wanted then
+                return child
+            end
+        end
+        return nil
+    end
+
+    -- Путь из Explorer'а: PlayerGui.Main.Frame.Layout...  Первый сегмент можно
+    -- не писать - он всё равно отбрасывается.
+    function Trade.Resolve(path)
+        local gui = PlayerGui()
+        if not gui then
+            return nil
+        end
+        local node = gui
+        local ok = pcall(function()
+            for part in string.gmatch(tostring(path), "[^%.]+") do
+                if node and string.lower(part) ~= "playergui" then
+                    node = ChildNamed(node, part)
+                end
+            end
+        end)
+        if ok then
+            return node
+        end
+        return nil
+    end
+
+    -- Разбор пути по звеньям: видно, на каком именно сегменте цепочка рвётся.
+    -- Без этого «кнопки нет» ничего не объясняет.
+    function Trade.Explain(path)
+        local gui = PlayerGui()
+        if not gui then
+            return "no PlayerGui"
+        end
+        local node = gui
+        local trail = { "PlayerGui[" .. tostring(gui.ClassName) .. "]" }
+        for part in string.gmatch(tostring(path), "[^%.]+") do
+            if string.lower(part) ~= "playergui" then
+                local nextNode = ChildNamed(node, part)
+                if not nextNode then
+                    trail[#trail + 1] = part .. "<MISSING>"
+                    return table.concat(trail, ".")
+                end
+                node = nextNode
+                trail[#trail + 1] = part .. "[" .. tostring(nextNode.ClassName) .. "]"
+            end
+        end
+        return table.concat(trail, ".")
+    end
+
+    -- Видимость по всей цепочке родителей: у закрытых диалогов кнопки остаются
+    -- в дереве, и без этой проверки можно нажать подтверждение в чужом окне.
+    function Trade.IsShown(element)
+        if not element then
+            return false
+        end
+        local node = element
+        while node and node ~= game do
+            local okGui, isGui = pcall(function()
+                return node:IsA("GuiObject")
+            end)
+            if okGui and isGui and node.Visible == false then
+                return false
+            end
+            local okLayer, isLayer = pcall(function()
+                return node:IsA("LayerCollector")
+            end)
+            if okLayer and isLayer and node.Enabled == false then
+                return false
+            end
+            node = node.Parent
+        end
+        return true
+    end
+
+    -- Узел по пути отдаём как есть, даже если это не GuiButton: в этой игре
+    -- Trade - обычный фрейм с обработчиком, и проверка IsA("GuiButton") его
+    -- отбрасывала. Из-за неё авто-трейд «ждал меню» вечно, хотя меню было
+    -- открыто прямо на экране.
+    function Trade.FindButton()
+        -- 1. Точный путь до самой кнопки.
+        local exact = Trade.Resolve(Trade.ButtonPath)
+        if exact then
+            return exact
+        end
+        -- 2. Фрейм-обёртка: ClickTarget сам найдёт TextButton внутри.
+        local frame = Trade.Resolve(Trade.ButtonFrame)
+        if frame then
+            return frame
+        end
+        for _, parentPath in ipairs(Trade.ButtonParents) do
+            local parent = Trade.Resolve(parentPath)
+            if parent then
+                local direct = ChildNamed(parent, "Trade")
+                if direct then
+                    return direct
+                end
+                for _, child in ipairs(parent:GetDescendants()) do
+                    if string.lower(tostring(child.Name)) == "trade" then
+                        return child
+                    end
+                end
+            end
+        end
+        -- Последний шанс: любой узел с именем ровно Trade в PlayerGui. Путь в
+        -- этой сборке мог уехать на один уровень, а имя кнопки осталось.
+        local gui = PlayerGui()
+        if not gui then
+            return nil
+        end
+        local best = nil
+        for _, obj in ipairs(gui:GetDescendants()) do
+            if string.lower(tostring(obj.Name)) == "trade" then
+                if not best or (Trade.IsShown(obj) and not Trade.IsShown(best)) then
+                    best = obj
+                end
+            end
+        end
+        return best
+    end
+
+    -- Куда реально жать: сама кнопка, кнопка внутри фрейма, родитель-кнопка
+    -- или сам узел (у фреймов клик часто висит на Activated/InputBegan).
+    function Trade.ClickTarget(node)
+        if not node then
+            return nil
+        end
+        local ok, isButton = pcall(function()
+            return node:IsA("GuiButton")
+        end)
+        if ok and isButton then
+            return node
+        end
+        for _, child in ipairs(node:GetChildren()) do
+            local okChild, childButton = pcall(function()
+                return child:IsA("GuiButton")
+            end)
+            if okChild and childButton then
+                return child
+            end
+        end
+        local parent = node.Parent
+        if parent then
+            local okParent, parentButton = pcall(function()
+                return parent:IsA("GuiButton")
+            end)
+            if okParent and parentButton then
+                return parent
+            end
+        end
+        for _, child in ipairs(node:GetDescendants()) do
+            local okChild, childButton = pcall(function()
+                return child:IsA("GuiButton")
+            end)
+            if okChild and childButton then
+                return child
+            end
+        end
+        return node
+    end
+
+    function Trade.FindConfirm()
+        for _, path in ipairs(Trade.ConfirmPaths) do
+            local node = Trade.Resolve(path)
+            if node and Trade.IsShown(node) then
+                return node
+            end
+        end
+        for _, path in ipairs(Trade.ConfirmFallback) do
+            local node = Trade.Resolve(path)
+            if node and Trade.IsShown(node) then
+                return node
+            end
+        end
+        -- Последний шанс: кнопка Teleport внутри окна, в имени которого есть
+        -- trade или verify. Остальные Teleport игнорируются.
+        local gui = PlayerGui()
+        if not gui then
+            return nil
+        end
+        for _, obj in ipairs(gui:GetDescendants()) do
+            if obj:IsA("GuiObject") and string.lower(tostring(obj.Name)) == "teleport" then
+                local node = obj.Parent
+                local depth = 0
+                local match = false
+                while node and node ~= gui and depth < 4 do
+                    local name = string.lower(tostring(node.Name))
+                    if string.find(name, "trade", 1, true) or string.find(name, "verify", 1, true) then
+                        match = true
+                        break
+                    end
+                    depth = depth + 1
+                    node = node.Parent
+                end
+                if match and Trade.IsShown(obj) then
+                    return obj
+                end
+            end
+        end
+        return nil
+    end
+
+    -- Прожать обработчики конкретного сигнала. У RBXScriptConnection нет
+    -- :Fire(), жать надо connection.Function.
+    local function FireSignal(obj, signalName)
+        if type(getconnections) ~= "function" or not obj then
+            return false
+        end
+        local okSignal, signal = pcall(function()
+            return obj[signalName]
+        end)
+        if not okSignal or not signal then
+            return false
+        end
+        local ok, connections = pcall(getconnections, signal)
+        if not ok or type(connections) ~= "table" or #connections == 0 then
+            return false
+        end
+        local fired = 0
+        for _, connection in ipairs(connections) do
+            local handler = connection.Function or connection.func
+            if type(handler) == "function" then
+                if pcall(handler) then
+                    fired = fired + 1
+                end
+            end
+        end
+        return fired > 0
+    end
+
+    local function Click(node)
+        if not node then
+            return false, "no node"
+        end
+        local target = Trade.ClickTarget(node)
+        if not target then
+            return false, "no target"
+        end
+        local okTarget, isButton = pcall(function()
+            return target:IsA("GuiButton")
+        end)
+        local isRealButton = okTarget and isButton
+
+        -- Не кнопка (фрейм / лейбл): сначала её собственные обработчики.
+        -- Именно так устроен Side.Trade, и обычный путь хаба его пропускал.
+        if not isRealButton then
+            for _, name in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down", "InputBegan" }) do
+                if FireSignal(target, name) then
+                    return true, "connection:" .. name
+                end
+            end
+            if target ~= node and FireSignal(node, "InputBegan") then
+                return true, "node:InputBegan"
+            end
+        end
+
+        -- Кнопка (или обработчиков не нашлось): стандартная лестница хаба.
+        if Hub.Crates and type(Hub.Crates.Click) == "function" then
+            local ok, method = Hub.Crates.Click(target)
+            if ok then
+                return true, method
+            end
+        end
+
+        if not isRealButton then
+            for _, name in ipairs({ "Activated", "MouseButton1Click", "InputBegan" }) do
+                if FireSignal(node, name) then
+                    return true, "node:" .. name
+                end
+            end
+        end
+        return false, "no click method"
+    end
+
+    -- Окно «Are you sure you want to teleport?» появляется не сразу, поэтому
+    -- ждём кнопку до таймаута, а не жмём один раз вслепую.
+    function Trade.Confirm(timeout)
+        local limit = tonumber(timeout) or tonumber(State.TradeConfirmTimeout) or 5
+        local started = os.clock()
+        while os.clock() - started < limit do
+            local button = Trade.FindConfirm()
+            if button then
+                local ok, method = Click(button)
+                if ok then
+                    Trade.Confirms = Trade.Confirms + 1
+                    Trade.LastAt = tick()
+                    Trade.LastPath = FullName(button)
+                    Report(string.format("step 2/2 - Teleport[%s] pressed (%s)",
+                        tostring(button.ClassName), tostring(method)))
+                    return true
+                end
+            end
+            task.wait(Trade.Cadence)
+        end
+        return false
+    end
+
+    -- Шаг 1 из 2: сама кнопка TRADE в меню ShardGamba.
+    function Trade.Press()
+        local button = Trade.FindButton()
+        if not button then
+            Report("step 1/2 - TRADE button not found, open the Shard menu")
+            return false
+        end
+        local ok, method = Click(button)
+        if not ok then
+            Report("step 1/2 - TRADE click failed: " .. tostring(method))
+            return false
+        end
+        Trade.Enters = Trade.Enters + 1
+        Trade.LastPath = FullName(button)
+        Report(string.format("step 1/2 - TRADE[%s] pressed (%s)",
+            tostring(button.ClassName), tostring(method)))
+        return true
+    end
+
+    -- Порядок строго такой: сначала TRADE, и только потом подтверждение.
+    -- Обратный порядок не работает - окна Teleport без нажатого TRADE нет.
+    function Trade.Enter(timeout)
+        local limit = timeout or tonumber(State.TradeConfirmTimeout) or 5
+        -- Единственное исключение: окно уже висит с прошлой попытки. Тогда
+        -- TRADE повторно не жмём - он это окно закроет, - а сразу шаг 2.
+        if Trade.FindConfirm() then
+            Report("step 2/2 - dialog already open")
+            return Trade.Confirm(limit)
+        end
+        if not Trade.Press() then
+            return false
+        end
+        return Trade.Confirm(limit)
+    end
+
+    -- Долбим кнопки, а не ждём «когда появится меню»: Press жмёт TRADE сразу,
+    -- как только путь резолвится, Confirm тут же проверяет окно. Между
+    -- попытками полсекунды, никаких пятисекундных простоев.
+    function Trade.Auto(attempts)
+        Trade.Token = Trade.Token + 1
+        local token = Trade.Token
+        Trade.Running = true
+        task.spawn(function()
+            local limit = tonumber(attempts) or 40
+            local wait = tonumber(State.TradeConfirmTimeout) or 5
+            for index = 1, limit do
+                if Trade.Token ~= token or State.AutoTrade ~= true then
+                    Trade.Running = false
+                    return
+                end
+                Trade.Attempts = index
+                local done = false
+                if Trade.FindConfirm() then
+                    done = Trade.Confirm(math.min(wait, 2))
+                elseif Trade.Press() then
+                    done = Trade.Confirm(math.min(wait, 3))
+                end
+                if done then
+                    Trade.Running = false
+                    Report(string.format("in TRADE (attempt %d)", index))
+                    return
+                end
+                if Trade.Enters == 0 then
+                    Report(string.format("attempt %d/%d - TRADE path not found", index, limit))
+                else
+                    Report(string.format("attempt %d/%d - pressed, no Teleport yet", index, limit))
+                end
+                task.wait(0.5)
+            end
+            Trade.Running = false
+            Report("gave up - Teleport never appeared")
+        end)
+    end
+
+    function Trade.Stop()
+        Trade.Token = Trade.Token + 1
+        Trade.Running = false
+        Report("stopped")
+    end
+
+    Hub.Trade = Trade
+end
+
+
 -- Auto skip --------------------------------------------------------------------
 -- The reward / battle pass / quest screens all expose a button whose name starts
 -- with "Skip". Paths from the Explorer:
@@ -21954,9 +22426,13 @@ do
     function Fov.apply(value)
         local target = math.clamp(tonumber(value) or 70, 1, FOV_MAX)
         Fov.value = target
+        -- Отъезд считаем ДО проверки камеры: если её ещё нет (спавн, телепорт),
+        -- step() подхватит значение, как только она появится. Иначе пришлось бы
+        -- дёргать Apply Now руками, потому что dolly остался бы нулевым.
+        Fov.dolly = (target > FOV_CAP) and Fov.dollyFor(target) or 0
         local cam = Fov.camera()
         if not cam then
-            Fov.message = "no camera yet"
+            Fov.message = string.format("%d deg - no camera yet", target)
             return false
         end
         if not Fov.original then
@@ -22038,9 +22514,14 @@ do
         end)
     end
 
-    function Fov.setEnabled(enabled)
+    -- value необязателен: без него берётся текущее Fov.value. С ним включение
+    -- сразу ставит нужный угол, а не тот, что остался в модуле по умолчанию.
+    function Fov.setEnabled(enabled, value)
         Fov.on = enabled == true
         if Fov.on then
+            if value ~= nil then
+                Fov.value = math.clamp(tonumber(value) or Fov.value, 1, FOV_MAX)
+            end
             Fov.apply(Fov.value)
             Fov.bind()
         else
@@ -22567,6 +23048,8 @@ State.CrateTopOnly = Config.CrateTopOnly ~= false
 State.CrateAutoRefresh = Config.CrateAutoRefresh ~= false
 State.CrateRefreshSeconds = math.clamp(math.floor(tonumber(Config.CrateRefreshSeconds) or 10), 3, 120)
 State.SkipBattlePass = Config.SkipBattlePass == true
+State.AutoTrade = Config.AutoTrade == true
+State.TradeConfirmTimeout = math.clamp(math.floor(tonumber(Config.TradeConfirmTimeout) or 5), 1, 30)
 State.Fullbright = Config.Fullbright == true
 State.FullbrightBrightness = math.clamp(tonumber(Config.FullbrightBrightness) or 3, 0, 10)
 State.FullbrightAmbient = type(Config.FullbrightAmbient) == "table" and Config.FullbrightAmbient or { 200, 200, 200 }
@@ -22675,6 +23158,8 @@ local function SaveConfig()
         CrateAutoRefresh = State.CrateAutoRefresh,
         CrateRefreshSeconds = State.CrateRefreshSeconds,
         SkipBattlePass = State.SkipBattlePass,
+        AutoTrade = State.AutoTrade,
+        TradeConfirmTimeout = State.TradeConfirmTimeout,
         AutoLoad = State.AutoLoad,
         AutoLoadSource = State.AutoLoadSource,
         AutoLoadDelay = State.AutoLoadDelay,
@@ -24077,6 +24562,93 @@ ItemBox:AddActionRow("Show Item Status", "Prints the cooldown toast counter and 
         Hub.Items.BasketUses))
 end)
 
+-- Auto Trade: заход на торговую площадь (в игре она называется просто TRADE) ---
+
+local TradeBox = FarmTab:CreateGroupBox("Right", "Auto Trade", "TRADE", StarHubUI.Icons.Teleport)
+TradeBox:AddToggle("Auto Enter Trade On Load", "Presses TRADE and confirms Teleport right after inject",
+    State.AutoTrade, function(value)
+        State.AutoTrade = value == true
+        if Hub.Trade then
+            if State.AutoTrade then
+                Hub.Trade.Auto()
+            else
+                Hub.Trade.Stop()
+            end
+        end
+        QueueSave()
+    end)
+TradeBox:AddSlider("Confirm Timeout", 1, 15, State.TradeConfirmTimeout, "SEC", function(value)
+    State.TradeConfirmTimeout = math.clamp(math.floor((tonumber(value) or 5) + 0.5), 1, 15)
+    QueueSave()
+end)
+TradeBox:AddActionRow("Enter Trade Now", "Presses TRADE and the Teleport confirmation", StarHubUI.Icons.Teleport, function()
+    local ok = Hub.Trade and Hub.Trade.Enter(tonumber(State.TradeConfirmTimeout) or 5)
+    Notify("Trade", ok and "teleport confirmed - going to TRADE"
+        or "TRADE button not found - open the Shard menu first")
+end)
+TradeBox:AddActionRow("Confirm Teleport Only", "Presses Teleport if the dialog is already open", StarHubUI.Icons.Check, function()
+    local ok = Hub.Trade and Hub.Trade.Confirm(3)
+    Notify("Trade", ok and "confirmed" or "no confirmation dialog on screen")
+end)
+TradeBox:AddActionRow("Find Trade Buttons", "Prints TRADE and Teleport nodes with full paths", StarHubUI.Icons.Search, function()
+    if not Hub.Trade then
+        return
+    end
+    local button = Hub.Trade.FindButton()
+    local confirm = Hub.Trade.FindConfirm()
+    print("[Trade] TRADE   : " .. (button and (button:GetFullName() .. " | " .. button.ClassName) or "not found"))
+    print("[Trade] Teleport: " .. (confirm and (confirm:GetFullName() .. " | " .. confirm.ClassName) or "not found"))
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if gui then
+        for _, obj in ipairs(gui:GetDescendants()) do
+            if obj:IsA("GuiObject") then
+                local lower = string.lower(tostring(obj.Name))
+                if string.find(lower, "trade", 1, true) or lower == "teleport" then
+                    print(string.format("[Trade] %s | %s | visible %s",
+                        obj:GetFullName(), obj.ClassName, tostring(obj.Visible)))
+                end
+            end
+        end
+    end
+    Notify("Trade", (button and "TRADE ok" or "TRADE missing") .. " | "
+        .. (confirm and "Teleport ok" or "Teleport missing"))
+end)
+TradeBox:AddActionRow("Explain Trade Path", "Shows which segment of the path is missing", StarHubUI.Icons.Info, function()
+    if not Hub.Trade then
+        return
+    end
+    local lines = {
+        Hub.Trade.Explain(Hub.Trade.ButtonPath),
+        Hub.Trade.Explain(Hub.Trade.ConfirmPaths[1]),
+        Hub.Trade.Explain(Hub.Trade.ConfirmPaths[2]),
+    }
+    for _, line in ipairs(lines) do
+        print("[Trade] " .. line)
+    end
+    if type(setclipboard) == "function" then
+        pcall(setclipboard, table.concat(lines, "\n"))
+    end
+    Notify("Trade", lines[1])
+end)
+Gui.TradeStatus = MakeInfoRow(TradeBox, "Auto trade: idle", "not started", StarHubUI.Icons.Info)
+
+if Hub.Trade then
+    Hub.Trade.Listener = function(text)
+        if not Gui.TradeStatus then
+            return
+        end
+        local status = tostring(text)
+        if #status > 48 then
+            status = string.sub(status, 1, 45) .. "..."
+        end
+        Gui.TradeStatus:SetTitle("Auto trade: " .. status)
+        Gui.TradeStatus:SetDesc(string.format("enters %d | confirms %d | %s",
+            Hub.Trade.Enters or 0,
+            Hub.Trade.Confirms or 0,
+            Hub.Trade.Running and "running" or "idle"))
+    end
+end
+
 
 local function PaintItemStatus()
     if not Hub.Items then
@@ -24976,11 +25548,16 @@ do
     local FovBox = LightTab:CreateGroupBox("Right", "Field Of View", "CAMERA", StarHubUI.Icons.Visuals)
     local FovToggle = FovBox:AddToggle("Enable FOV", "Overrides the camera field of view", State.FovEnabled, function(value)
         State.FovEnabled = value == true
-        Hub.Fov.setEnabled(State.FovEnabled)
+        -- Угол передаём явно: без него модуль применил бы своё значение по
+        -- умолчанию (70), и камера возвращалась бы к базовому обзору.
+        Hub.Fov.setEnabled(State.FovEnabled, State.FovValue)
         QueueSave()
     end)
     FovBox:AddSlider("Field Of View", 1, 200, State.FovValue, "°", function(value)
         State.FovValue = math.clamp(math.floor((tonumber(value) or 70) + 0.5), 1, 200)
+        -- Fov.value держим синхронным с ползунком: именно его берёт setEnabled,
+        -- когда FOV включают тумблером.
+        Hub.Fov.value = State.FovValue
         if State.FovEnabled then
             Hub.Fov.apply(State.FovValue)
         else
@@ -24989,8 +25566,13 @@ do
         QueueSave()
     end)
     FovBox:AddActionRow("Apply Now", "Re-pushes the angle into the camera", StarHubUI.Icons.Refresh, function()
-        FovToggle:Set(true)
+        State.FovEnabled = true
+        Hub.Fov.setEnabled(true, State.FovValue)
+        pcall(function()
+            FovToggle:Set(true)
+        end)
         Notify("Field Of View", Hub.Fov.message)
+        QueueSave()
     end)
     FovBox:AddActionRow("Reset FOV", "Restores the camera's original angle", StarHubUI.Icons.Refresh, function()
         Hub.Fov.reset()
@@ -25008,7 +25590,10 @@ do
 
     if State.FovEnabled then
         task.defer(function()
-            Hub.Fov.setEnabled(true)
+            -- Раньше тут стоял просто setEnabled(true), а Fov.value к этому
+            -- моменту всё ещё 70 из объявления модуля - камера получала
+            -- базовый угол вместо сохранённого. Теперь угол берём из State.
+            Hub.Fov.setEnabled(true, State.FovValue)
         end)
     end
 end
@@ -25289,6 +25874,20 @@ do
                     applied = applied + 1
                 end
             end
+        end
+        -- Fluent не вызывает callback, если значение не изменилось. При
+        -- автозагрузке конфига тумблер и ползунок FOV часто уже стоят на тех же
+        -- числах, поэтому callback молчит, и камера остаётся на базовом угле.
+        -- Пушим FOV руками из State - это единственное место, через которое
+        -- проходит и автозагрузка, и кнопка Load, и импорт.
+        if Hub.Fov then
+            pcall(function()
+                if State.FovEnabled then
+                    Hub.Fov.setEnabled(true, State.FovValue)
+                else
+                    Hub.Fov.setEnabled(false)
+                end
+            end)
         end
         return applied
     end
@@ -25762,6 +26361,16 @@ if Farm.ClearAuto then
     task.delay(4, function()
         Gui.Step("post:clearauto-run")
         pcall(Farm.ClearAutoRun)
+    end)
+end
+
+-- Auto trade: заход на торговую площадь сразу после инжекта. Задержка нужна,
+-- чтобы клиент успел собрать меню; сам Auto повторяет попытки раз в секунду.
+if State.AutoTrade and Hub.Trade then
+    task.delay(3, function()
+        if State.AutoTrade then
+            pcall(Hub.Trade.Auto)
+        end
     end)
 end
 
