@@ -20297,6 +20297,17 @@ do
             "legendary", "exclusive", "ancient", "epic", "rare", "uncommon", "common",
         },
         Listener = nil,
+        -- Instant skip. The server answers an open with NotGambling.Opening
+        -- (the drop table) and then waits for the client to fire Opening back.
+        -- The stock client burns that wait on the whole shard animation, so
+        -- answering straight away is what turns a ~7 s crate into ~0.15 s.
+        Skip = true,
+        Gap = 0.05,
+        Opening = nil,
+        Conn = nil,
+        Opened = 0,
+        LastDrop = "",
+        KindIndex = 0,
     }
 
     local VimService = nil
@@ -20328,6 +20339,172 @@ do
         if type(Crates.Listener) == "function" then
             pcall(Crates.Listener, Crates.Status)
         end
+    end
+
+    -- ------------------------------------------------------------------
+    -- instant skip
+    -- ------------------------------------------------------------------
+    -- NotGambling.Opening is the server telling us "here is your drop".
+    -- Firing it right back is the client's "seen it, continue" signal. If we
+    -- send that immediately the animation never runs and the next crate can
+    -- start at once, which is the whole trick.
+    local function NotGamblingRoot()
+        local ok, rs = pcall(function()
+            return game:GetService("ReplicatedStorage")
+        end)
+        if not ok or not rs then
+            return nil
+        end
+        return rs:FindFirstChild("NotGambling")
+    end
+
+    function Crates.Ack()
+        local root = NotGamblingRoot()
+        local opening = root and root:FindFirstChild("Opening")
+        if not opening then
+            return false
+        end
+        local ok = pcall(function()
+            opening:FireServer()
+        end)
+        return ok
+    end
+
+    function Crates.DropNames(results)
+        local names = {}
+        if type(results) ~= "table" then
+            return names
+        end
+        for _, entry in ipairs(results) do
+            local label
+            if type(entry) == "table" then
+                label = entry[1] or entry.Name or entry.ID or entry.Rarity
+            else
+                label = entry
+            end
+            if label ~= nil then
+                names[#names + 1] = tostring(label)
+            end
+        end
+        return names
+    end
+
+    -- One listener for the whole session. It always acks (when Skip is on)
+    -- and, while auto is running, immediately chains the next crate.
+    --
+    -- While skip is on the reward overlay is useless: the game still clones a
+    -- "?" card per drop into ShardReward.Align and the fade never gets cleared
+    -- because we never wait out the animation, so the screen fills with
+    -- leftovers. Hide the ScreenGui and sweep the clones.
+    function Crates.CleanReward()
+        local player = Players.LocalPlayer
+        local pg = player and player:FindFirstChild("PlayerGui")
+        local sr = pg and pg:FindFirstChild("ShardReward")
+        if not sr then
+            return
+        end
+        if not Crates.Skip then
+            pcall(function()
+                if sr:IsA("ScreenGui") and not sr.Enabled then
+                    sr.Enabled = true
+                end
+            end)
+            return
+        end
+        pcall(function()
+            if sr:IsA("ScreenGui") and sr.Enabled then
+                sr.Enabled = false
+            end
+        end)
+        local align = sr:FindFirstChild("Align")
+        if not align then
+            return
+        end
+        for _, child in ipairs(align:GetChildren()) do
+            if not child:IsA("UIGridLayout") and not child:IsA("UIAspectRatioConstraint") then
+                pcall(function()
+                    child:Destroy()
+                end)
+            end
+        end
+    end
+
+    function Crates.Attach()
+        local root = NotGamblingRoot()
+        local opening = root and root:FindFirstChild("Opening")
+        if not opening then
+            -- NotGambling only exists in the shard place, so on any other map
+            -- keep looking instead of giving up on the first miss
+            if not Crates.Waiting then
+                Crates.Waiting = true
+                Report("waiting for NotGambling.Opening")
+                task.spawn(function()
+                    for _ = 1, 120 do
+                        task.wait(1)
+                        local r = NotGamblingRoot()
+                        local op = r and r:FindFirstChild("Opening")
+                        if op then
+                            Crates.Waiting = false
+                            Crates.Attach()
+                            return
+                        end
+                    end
+                    Crates.Waiting = false
+                    Report("NotGambling.Opening never appeared")
+                end)
+            end
+            return false
+        end
+        if Crates.Opening == opening and Crates.Conn then
+            return true
+        end
+        if Crates.Conn then
+            pcall(function()
+                Crates.Conn:Disconnect()
+            end)
+        end
+        Crates.Opening = opening
+        Crates.Conn = opening.OnClientEvent:Connect(function(results)
+            Crates.Opened = (Crates.Opened or 0) + 1
+            local names = Crates.DropNames(results)
+            Crates.LastDrop = #names > 0 and table.concat(names, ", ") or "?"
+
+            if Crates.Skip then
+                Crates.Ack()
+                pcall(Crates.CleanReward)
+            end
+
+            if not Crates.AutoRunning then
+                return
+            end
+            task.wait(tonumber(Crates.Gap) or 0.05)
+            if not Crates.AutoRunning then
+                return
+            end
+            local kinds = Crates.Kinds()
+            if #kinds == 0 then
+                Crates.AutoRunning = false
+                Report("auto stopped - no crate ticked")
+                return
+            end
+            Crates.KindIndex = ((Crates.KindIndex or 0) % #kinds) + 1
+            pcall(Crates.Open, kinds[Crates.KindIndex])
+        end)
+        Report("instant skip ready")
+
+        -- keep the overlay hidden and the clones swept for as long as the hub
+        -- runs, because the game re-shows it every time a crate opens
+        if not Crates.CleanThread then
+            Crates.CleanThread = true
+            task.spawn(function()
+                while State.Running do
+                    pcall(Crates.CleanReward)
+                    task.wait(0.5)
+                end
+                Crates.CleanThread = false
+            end)
+        end
+        return true
     end
 
     local function PlayerGuiOf()
@@ -20570,9 +20747,9 @@ do
         return nil
     end
 
-    -- Real crate names as the server expects them. The captured call was
-    -- ReplicatedStorage.NotGambling:FireServer(3, "Golden") - only the second
-    -- argument changes between crates, the first one is the amount.
+    -- Real crate names as the server expects them. The game's own buttons call
+    -- NotGambling:FireServer(slot, name): 1 = crate A, 2 = B, 3 = C. Only the
+    -- second argument is the crate, the first one is the slot.
     -- The side buttons are named Cursed / MegaDiamond, so the ids follow them.
     Crates.Names = {
         cursed = "Cursed",
@@ -20661,7 +20838,7 @@ do
             return false, "NotGambling remote not found"
         end
         local name = Crates.Names[string.lower(tostring(kind))] or tostring(kind)
-        local amount = math.clamp(math.floor(tonumber(count) or 3), 1, 100)
+        local amount = math.clamp(math.floor(tonumber(count) or 1), 1, 3)
         local ok, err = pcall(function()
             remote:FireServer(amount, name)
         end)
@@ -20674,6 +20851,10 @@ do
     function Crates.Open(kind)
         kind = string.lower(tostring(kind or "cursed"))
         Crates.LastKind = kind
+
+        -- make sure the instant-skip listener is live before we fire, so even
+        -- a one-off manual open skips the animation
+        pcall(Crates.Attach)
 
         local fired, name, amount = Crates.Fire(kind, State.CrateAmount)
         if fired then
@@ -20713,6 +20894,9 @@ do
         if State.CrateDiamond then
             table.insert(kinds, "diamond")
         end
+        if State.CrateGolden then
+            table.insert(kinds, "golden")
+        end
         return kinds
     end
 
@@ -20724,33 +20908,20 @@ do
             Report("auto off")
             return
         end
-        local token = Crates.AutoToken
         Report("auto on")
-        task.spawn(function()
-            while Crates.AutoRunning and Crates.AutoToken == token do
-                local kinds = Crates.Kinds()
-                if #kinds == 0 then
-                    Report("auto on - no crate ticked")
-                    task.wait(1)
-                else
-                    for _, kind in ipairs(kinds) do
-                        if not Crates.AutoRunning or Crates.AutoToken ~= token then
-                            break
-                        end
-                        pcall(Crates.Open, kind)
-                        task.wait(0.5)
-                    end
-                    local delay = math.clamp(tonumber(State.CrateInterval) or 5, 1, 120)
-                    Crates.NextAutoAt = tick() + delay
-                    local spent = 0
-                    while Crates.AutoRunning and Crates.AutoToken == token and spent < delay do
-                        task.wait(0.2)
-                        spent = spent + 0.2
-                    end
-                    Crates.NextAutoAt = 0
-                end
-            end
-        end)
+        -- The old build polled on a timer and never answered Opening, so the
+        -- server sat waiting for the animation every single crate. Now the
+        -- chain is driven by the Opening event itself: open -> ack -> open.
+        Crates.Attach()
+        local kinds = Crates.Kinds()
+        if #kinds == 0 then
+            Crates.AutoRunning = false
+            Report("auto on - no crate ticked")
+            return
+        end
+        Crates.KindIndex = 0
+        Crates.KindIndex = 1
+        pcall(Crates.Open, kinds[1])
     end
 
     local function RarityOf(text)
@@ -21114,6 +21285,14 @@ do
     end
 
     Hub.Crates = Crates
+
+    -- instant skip is on by default: it only ever removes dead waiting time,
+    -- it never changes what the server hands out
+    Crates.Skip = (State.CrateSkip ~= false)
+    Crates.Gap = tonumber(State.CrateGap) or 0.05
+    task.defer(function()
+        pcall(Crates.Attach)
+    end)
 end
 
 
@@ -22499,6 +22678,11 @@ do
             return
         end
         Fov.bound = true
+        -- Повторная инжекция оставляет старое имя в RenderStep, и BindToRenderStep
+        -- падает с «already bound». Снимаем перед привязкой.
+        pcall(function()
+            FovRun:UnbindFromRenderStep(FOV_BIND_NAME)
+        end)
         pcall(function()
             FovRun:BindToRenderStep(FOV_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, Fov.step)
         end)
@@ -22562,6 +22746,34 @@ do
     end
 
     Hub.Fov = Fov
+
+    -- Сторож. При auto-execute скрипт стартует раньше, чем появляется камера, и
+    -- setEnabled успевает отработать вхолостую: apply возвращает false, bind
+    -- вешается, но камеры ещё нет. Поэтому раз в полсекунды сверяем настройку
+    -- с реальным состоянием камеры и добиваем - независимо от порядка загрузки.
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            pcall(function()
+                if State.FovEnabled ~= true then
+                    return
+                end
+                local target = math.clamp(tonumber(State.FovValue) or 70, 1, FOV_MAX)
+                if not Fov.on then
+                    Fov.setEnabled(true, target)
+                    return
+                end
+                local cam = Fov.camera()
+                if not cam then
+                    return
+                end
+                local want = math.min(target, FOV_CAP)
+                if math.abs(Fov.read(cam) - want) > 0.6 then
+                    Fov.apply(target)
+                end
+            end)
+        end
+    end)
 
     -- Applies a saved snapshot once the hub is up (crash-loop protected).
     -- ВРЕМЕННО выключено: setfflag пачкой на старте умеет вешать движок,
@@ -24693,10 +24905,27 @@ local CrateTab = Window:CreateTab({
 })
 
 local CrateBox = CrateTab:CreateGroupBox("Left", "Crate Opener", "CURSED / DIAMOND", StarHubUI.Icons.Skull)
-CrateBox:AddToggle("Auto Open Crates", "Opens the ticked crates on the timer below", State.CrateAuto, function(value)
+CrateBox:AddToggle("Auto Open Crates", "Chains crates back to back - no timer, no animation wait", State.CrateAuto, function(value)
     State.CrateAuto = value == true
     if Hub.Crates then
         Hub.Crates.SetAuto(State.CrateAuto)
+    end
+    QueueSave()
+end)
+-- The skip is what makes the chain fast. It answers NotGambling.Opening the
+-- moment the server sends the drop table, instead of waiting out the shard
+-- animation, so one crate lands in roughly 0.15 s.
+CrateBox:AddToggle("Instant Skip", "Answers the shard animation immediately (works on manual opens too)", State.CrateSkip ~= false, function(value)
+    State.CrateSkip = value == true
+    if Hub.Crates then
+        Hub.Crates.Skip = State.CrateSkip
+    end
+    QueueSave()
+end)
+CrateBox:AddSlider("Chain Gap", 0, 50, math.floor((tonumber(State.CrateGap) or 0.05) * 100 + 0.5), " x10ms", function(value)
+    State.CrateGap = math.clamp((tonumber(value) or 5) / 100, 0, 0.5)
+    if Hub.Crates then
+        Hub.Crates.Gap = State.CrateGap
     end
     QueueSave()
 end)
@@ -24706,6 +24935,10 @@ CrateBox:AddToggle("Cursed Crate", "Include the cursed crate in the rotation", S
 end)
 CrateBox:AddToggle("Diamond Crate", "Include the diamond crate in the rotation", State.CrateDiamond, function(value)
     State.CrateDiamond = value == true
+    QueueSave()
+end)
+CrateBox:AddToggle("Golden Crate", "Include the plain Golden Shard crate (80) in the rotation", State.CrateGolden, function(value)
+    State.CrateGolden = value == true
     QueueSave()
 end)
 -- The side button is called MegaDiamond, so that is the name sent to the remote.
@@ -24726,20 +24959,26 @@ CrateBox:AddSlider("Open Every", 1, 120, State.CrateInterval, " s", function(val
     State.CrateInterval = math.clamp(math.floor(tonumber(value) or 5), 1, 120)
     QueueSave()
 end)
--- The 3 in NotGambling:FireServer(3, "Golden") - kept adjustable because the
--- server decides what it means (amount / tier / index).
-CrateBox:AddSlider("Open Amount", 1, 10, State.CrateAmount, "x", function(value)
-    State.CrateAmount = math.clamp(math.floor(tonumber(value) or 3), 1, 10)
+-- First argument of NotGambling:FireServer is the crate SLOT, not an amount:
+-- the game's own buttons fire 1 for A, 2 for B, 3 for C. Calling it an amount
+-- was wrong - a value of 3 always opened slot C.
+CrateBox:AddSlider("Crate Slot (1=A 2=B 3=C)", 1, 3, math.clamp(math.floor(tonumber(State.CrateAmount) or 1), 1, 3), "", function(value)
+    State.CrateAmount = math.clamp(math.floor(tonumber(value) or 1), 1, 3)
     QueueSave()
 end)
 Gui.CrateStatus = MakeInfoRow(CrateBox, "Crates: idle", "auto off", StarHubUI.Icons.Skull)
-CrateBox:AddActionRow("Open Cursed Now", "Fires NotGambling(amount, \"Cursed\")", StarHubUI.Icons.Zap, function()
+Gui.CrateDrop = MakeInfoRow(CrateBox, "Last drop: -", "0 crate(s) answered this session", StarHubUI.Icons.Save)
+CrateBox:AddActionRow("Open Cursed Now", "Fires NotGambling(slot, \"Cursed\") once", StarHubUI.Icons.Zap, function()
     local ok, message = Hub.Crates.Open("cursed")
     Notify("Cursed Crate", tostring(message))
 end)
-CrateBox:AddActionRow("Open Diamond Now", "Fires NotGambling(amount, \"Diamond\")", StarHubUI.Icons.Zap, function()
+CrateBox:AddActionRow("Open Diamond Now", "Fires NotGambling(slot, \"Diamond\") once", StarHubUI.Icons.Zap, function()
     local ok, message = Hub.Crates.Open("diamond")
     Notify("Diamond Crate", tostring(message))
+end)
+CrateBox:AddActionRow("Open Golden Now", "Fires NotGambling(slot, \"Golden\") once - 80 crystals", StarHubUI.Icons.Zap, function()
+    local ok, message = Hub.Crates.Open("golden")
+    Notify("Golden Crate", tostring(message))
 end)
 local SkipBox = CrateTab:CreateGroupBox("Left", "Auto Skip", "REWARD SCREENS", StarHubUI.Icons.Zap)
 SkipBox:AddToggle("Auto Skip", "Clicks every Skip / SkipQuest button that appears", false, function(value)
@@ -24853,11 +25092,16 @@ local function PaintCrateStatus()
             nextIn = string.format(" | next in %ds", math.max(0, math.floor(Crates.NextAutoAt - tick())))
         end
         Gui.CrateStatus:SetTitle("Crates: " .. tostring(Crates.Status))
-        Gui.CrateStatus:SetDesc(string.format("auto %s | opened %d | click %s%s",
+        Gui.CrateStatus:SetDesc(string.format("auto %s | skip %s | %d opened | gap %.2fs%s",
             Crates.AutoRunning and "on" or "off",
-            Crates.Opens or 0,
-            tostring(Crates.LastClickMethod),
+            Crates.Skip and "on" or "off",
+            Crates.Opened or 0,
+            tonumber(Crates.Gap) or 0.05,
             nextIn))
+        if Gui.CrateDrop then
+            Gui.CrateDrop:SetTitle("Last drop: " .. (Crates.LastDrop ~= "" and Crates.LastDrop or "-"))
+            Gui.CrateDrop:SetDesc(string.format("%d crate(s) answered this session", Crates.Opened or 0))
+        end
     end
     if Gui.StockStatus then
         local age = ""
@@ -26341,6 +26585,22 @@ if Hub.Config then
     end
 end
 
+-- Диагностика FOV: одна строка в консоль через полторы секунды после загрузки.
+-- Если тут enabled=false - значит в конфиге тумблер выключен, и 200 ждать
+-- неоткуда; если enabled=true, а applied=70 - значит угол не доехал до камеры.
+if Hub.Fov then
+    task.delay(1.5, function()
+        pcall(function()
+            print(string.format("[FOV] enabled=%s value=%s on=%s applied=%s | %s",
+                tostring(State.FovEnabled),
+                tostring(State.FovValue),
+                tostring(Hub.Fov.on),
+                tostring(Hub.Fov.applied),
+                tostring(Hub.Fov.message)))
+        end)
+    end)
+end
+
 -- Промпты сквозь стены и авто-чистка карты теперь строго opt-in.
 -- Раньше они стартовали сами и обход Workspace вешал клиент сразу
 -- после появления меню.
@@ -26357,6 +26617,15 @@ end
 -- который сам не показал, так что режим был бесполезен.
 
 Farm.ClearAuto = State.ClearMapAuto ~= false
+-- Список из 168 объектов снимали в Skibidi Defense. В торговой плазе те же
+-- имена висят на других объектах, и автоклир там сносит карту и глушит NPC
+-- (проверено: после захода в плазу умерли промпты Detective и Hand и
+-- Map.Part). Поэтому авто-клир работает только в том плейсе, для которого
+-- его снимали. Ручная кнопка "Clear Map Once" остаётся как была.
+if Farm.ClearAuto and game.PlaceId ~= 14279693118 then
+    Farm.ClearAuto = false
+    Gui.Step("post:clearauto-skip (place " .. tostring(game.PlaceId) .. ")")
+end
 if Farm.ClearAuto then
     task.delay(4, function()
         Gui.Step("post:clearauto-run")
