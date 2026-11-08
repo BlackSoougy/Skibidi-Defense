@@ -2420,7 +2420,11 @@ task.spawn(function()
             and Remotes.Speed
             and not startupSpeedReset then
             startupSpeedReset = true
-            pcall(function() Remotes.Speed:FireServer(1) end)
+            -- Same rule as the tick below: a paused match stays paused.
+            local liveSpeed = SpeedValueObject()
+            if not (liveSpeed and tonumber(liveSpeed.Value) == 0) then
+                pcall(function() Remotes.Speed:FireServer(1) end)
+            end
         end
 
         local gui = GetPlayerGui()
@@ -2451,7 +2455,14 @@ task.spawn(function()
             and not State.Recording
 
         if speedEligible then
-            if speedReadySince == nil then
+            -- Pause is Speed 0, and pausing is a deliberate choice. Auto Speed
+            -- used to treat it as "wrong speed" and fire x4 over it a second
+            -- later, so a manual pause never held. Leave 0 alone entirely: the
+            -- moment the player unpauses, enforcement resumes on its own.
+            local liveSpeed = SpeedValueObject()
+            if liveSpeed and tonumber(liveSpeed.Value) == 0 then
+                speedReadySince = nil
+            elseif speedReadySince == nil then
                 speedReadySince = now
             elseif now - speedReadySince >= State.SpeedScaleDelay then
                 speedReadySince = now
