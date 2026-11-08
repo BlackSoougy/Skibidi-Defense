@@ -75,6 +75,7 @@ local State = {
     TowerMeta = setmetatable({}, { __mode = "k" }),
     RuntimeHandles = {},
     UsedRuntimeTowers = setmetatable({}, { __mode = "k" }),
+    PlaceRejects = {},
     PendingAbilityClickAt = -math.huge,
     PendingAbilityIndex = 1,
     DoorFarm = false,
@@ -1929,7 +1930,17 @@ local function PlayPlace(action)
         return true
     end
 
-    local deadline = os.clock() + 180
+    -- Every unit has its own "Placement Limit" (Dancing Camera 10, most others
+    -- 1). The server silently drops any request past that cap, so retrying for
+    -- three minutes never succeeds and stalls the whole playback. Two clean
+    -- misses in a row mean the cap is reached - skip the unit at once.
+    local rejects = State.PlaceRejects
+    local unitKey = tostring(action.Unit)
+    if (rejects[unitKey] or 0) >= 2 then
+        return false, "Placement limit reached for " .. unitKey
+    end
+
+    local deadline = os.clock() + 30
     local estimatedCost = tonumber(action.EstimatedCost) or 0
 
     while State.Playing and os.clock() < deadline and not IsGameEnded() do
@@ -1937,6 +1948,7 @@ local function PlayPlace(action)
         if existing then
             State.RuntimeHandles[action.Handle] = existing
             State.UsedRuntimeTowers[existing] = true
+            rejects[unitKey] = nil
             return true
         end
 
@@ -1950,7 +1962,13 @@ local function PlayPlace(action)
             if success and tower then
                 State.RuntimeHandles[action.Handle] = tower
                 State.UsedRuntimeTowers[tower] = true
+                rejects[unitKey] = nil
                 return true
+            end
+
+            rejects[unitKey] = (rejects[unitKey] or 0) + 1
+            if rejects[unitKey] >= 2 then
+                return false, "Placement limit reached for " .. unitKey
             end
         end
 
@@ -2158,8 +2176,13 @@ local function PlayAbility(action)
             tostring(tower.Name),
             slot
         )
-        if ok and accepted == true then
-            if marker == "" then
+        -- The game's spawnTowerAbility RemoteFunction no longer answers with
+        -- true/false: every accepted call returns nil. Only an explicit false
+        -- or a thrown error means the slot was refused. When the marker
+        -- attribute does not exist on the tower there is nothing to confirm
+        -- against, so trust the call instead of retrying the other slots.
+        if ok and accepted ~= false then
+            if marker == "" or previous == nil then
                 return true
             end
             local confirmed = WaitUntil(function()
@@ -2270,6 +2293,7 @@ local function StartPlayback()
     State.PlaybackFirstActionDone = false
     State.RuntimeHandles = {}
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
+    State.PlaceRejects = {}
 
     task.spawn(function()
         SetStatus("Playback", string.format("Running %s", State.ProfileName))
