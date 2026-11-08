@@ -61,6 +61,9 @@ local State = {
     DoorRewards = true,
     Speed = 1,
     Paused = false,
+    PausedSince = 0,
+    PauseFromPlayback = false,
+    SpeedBeforePause = 0,
     RecordSpeed = true,
     ClockSource = "",
     ClockTargets = "",
@@ -2111,30 +2114,103 @@ local function SpeedValueObject()
     return nil
 end
 
+-- Kept on the Hub table on purpose: the chunk sits a handful of locals below
+-- Lua's 200-local ceiling, so new top-level locals are not an option here.
+Hub.Pause = Hub.Pause or {}
+
+function Hub.Pause.Live()
+    local speedValue = SpeedValueObject()
+    return speedValue and tonumber(speedValue.Value) or nil
+end
+
+-- The pause button under the speed HUD is the exact path a human click takes.
+-- The Speed.Change remote answers fine on a running match, but once the match
+-- is frozen the server keeps the pause and ignores the release, so a pause the
+-- hub itself created could never be lifted again. Both routes are kept and the
+-- one that actually moves the value wins.
+function Hub.Pause.Button()
+    local playerGui = GetPlayerGui()
+    local towers = playerGui and playerGui:FindFirstChild("Towers")
+    local speedButton = towers and towers:FindFirstChild("speedButton")
+    local button = speedButton and speedButton:FindFirstChild("pause")
+    if button and button:IsA("GuiButton") then
+        return button
+    end
+    return nil
+end
+
+function Hub.Pause.FireButton()
+    local button = Hub.Pause.Button()
+    if not button or type(firesignal) ~= "function" then
+        return false
+    end
+    return pcall(function()
+        firesignal(button.MouseButton1Click)
+    end)
+end
+
+function Hub.Pause.Mark(value)
+    State.Paused = value == 0
+    State.PausedSince = value == 0 and os.clock() or 0
+end
+
+-- Pause is Speed 0, so the speed to come back to is gone the moment the pause
+-- lands. Remember it while it is still readable, and fall back to the Auto
+-- Speed target if a pause was already in place before the hub saw it.
+function Hub.Pause.Resume()
+    local resume = tonumber(State.SpeedBeforePause) or tonumber(State.Speed) or 4
+    resume = math.clamp(math.floor(resume), 1, 7)
+    if Remotes.Speed and Remotes.Speed:IsA("RemoteEvent") then
+        pcall(function()
+            Remotes.Speed:FireServer(resume)
+        end)
+    end
+    Hub.Pause.Mark(resume)
+    return resume
+end
+
 local function PlaySpeed(action)
-    local target = math.clamp(math.floor(tonumber(action.Speed) or 1), 0, 6)
+    local target = math.clamp(math.floor(tonumber(action.Speed) or 1), 0, 7)
     if not Remotes.Speed or not Remotes.Speed:IsA("RemoteEvent") then
         return false, "Speed.Change is unavailable"
     end
 
-    local speedValue = SpeedValueObject()
-    if speedValue and tonumber(speedValue.Value) == target then
+    local current = Hub.Pause.Live()
+    if target == 0 and current and current > 0 then
+        State.SpeedBeforePause = current
+    end
+
+    if current == target then
+        Hub.Pause.Mark(target)
         return true
     end
 
-    for _ = 1, 8 do
+    for attempt = 1, 8 do
         if not State.Playing then
             return false, "Playback stopped while changing speed"
         end
+
         Remotes.Speed:FireServer(target)
         local confirmed = WaitUntil(function()
             if not State.Playing then
                 return true
             end
-            local live = SpeedValueObject()
-            return live ~= nil and tonumber(live.Value) == target
-        end, 1.5, 0.05)
+            return Hub.Pause.Live() == target
+        end, 1.2, 0.05)
+
+        if not confirmed and attempt >= 3 then
+            Hub.Pause.FireButton()
+            confirmed = WaitUntil(function()
+                if not State.Playing then
+                    return true
+                end
+                return Hub.Pause.Live() == target
+            end, 1.0, 0.05)
+        end
+
         if confirmed then
+            State.PauseFromPlayback = target == 0
+            Hub.Pause.Mark(target)
             return true
         end
     end
@@ -2270,6 +2346,12 @@ local function StopPlayback(reason)
     if reason then
         SetStatus("Stopped", reason)
     end
+    -- A stop in the middle of a recorded pause must not leave the match
+    -- frozen: release only what the hub itself pressed.
+    if State.PauseFromPlayback and Hub.Pause.Live() == 0 then
+        State.PauseFromPlayback = false
+        Hub.Pause.Resume()
+    end
 end
 
 local function StartPlayback()
@@ -2294,6 +2376,13 @@ local function StartPlayback()
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
     State.PlaceRejects = {}
     State.SkippedActions = 0
+    State.PauseFromPlayback = false
+
+    -- A previous run that ended on a pause action leaves Speed at 0. Every
+    -- later action would then run against a frozen match, so lift it first.
+    if Hub.Pause.Live() == 0 then
+        Hub.Pause.Resume()
+    end
 
     task.spawn(function()
         SetStatus("Playback", string.format("Running %s", State.ProfileName))
@@ -2363,6 +2452,7 @@ local function StartPlayback()
                     or action.Type == "Upgrade"
                     or action.Type == "Target"
                     or action.Type == "Sell"
+                    or action.Type == "Speed"
 
                 if soft then
                     State.SkippedActions = (State.SkippedActions or 0) + 1
@@ -2382,7 +2472,16 @@ local function StartPlayback()
 
         if State.Playing then
             State.Playing = false
-            SetStatus("Playback complete", "Waiting for the match to end")
+            -- endlles finishes on a recorded pause (action 554, wave 135).
+            -- Leaving Speed at 0 freezes the match, the wave never ends, and
+            -- auto replay never fires - the farm just sits there. Release it.
+            if State.PauseFromPlayback then
+                State.PauseFromPlayback = false
+                local resumed = Hub.Pause.Resume()
+                SetStatus("Playback complete", string.format("Released the macro pause, back to x%d", resumed))
+            else
+                SetStatus("Playback complete", "Waiting for the match to end")
+            end
         end
     end)
 
@@ -2512,6 +2611,42 @@ task.spawn(function()
             end
         else
             speedReadySince = nil
+        end
+
+        -- Track the real pause state instead of trusting a flag nothing ever
+        -- wrote. Speed 0 is the only pause signal the game replicates.
+        local liveSpeedNow = Hub.Pause.Live()
+        if liveSpeedNow ~= nil then
+            if liveSpeedNow == 0 then
+                if not State.Paused then
+                    State.Paused = true
+                    State.PausedSince = now
+                end
+            else
+                State.Paused = false
+                State.PausedSince = 0
+            end
+        end
+
+        -- A pause this hub pressed must never outlive the run. If playback is
+        -- over and the match is still frozen two seconds later, lift it - the
+        -- wave would otherwise never end and auto replay would never fire.
+        -- A pause the player pressed by hand is untouched: it never sets the
+        -- PauseFromPlayback flag.
+        if State.PauseFromPlayback
+            and not State.Playing
+            and not State.Recording
+            and matchReady
+            and not ended
+            and Remotes.Speed
+            and now - (State.PausedSince or 0) >= 2 then
+            if liveSpeedNow == 0 then
+                State.PauseFromPlayback = false
+                local resumed = Hub.Pause.Resume()
+                SetStatus("Playback", string.format("Releasing the pause the macro left, back to x%d", resumed))
+            else
+                State.PauseFromPlayback = false
+            end
         end
 
         if ended and not replayLatched then
