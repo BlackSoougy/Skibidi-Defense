@@ -2176,13 +2176,12 @@ local function PlayAbility(action)
             tostring(tower.Name),
             slot
         )
-        -- The game's spawnTowerAbility RemoteFunction no longer answers with
-        -- true/false: every accepted call returns nil. Only an explicit false
-        -- or a thrown error means the slot was refused. When the marker
-        -- attribute does not exist on the tower there is nothing to confirm
-        -- against, so trust the call instead of retrying the other slots.
-        if ok and accepted ~= false then
-            if marker == "" or previous == nil then
+        -- The game answers true only when the cast really went through and
+        -- nil when it could not fire right now (cooldown, no target, wrong
+        -- slot). Keep true as the success signal - the real problem was that a
+        -- single nil used to abort the entire profile a few lines below.
+        if ok and accepted == true then
+            if marker == "" then
                 return true
             end
             local confirmed = WaitUntil(function()
@@ -2294,6 +2293,7 @@ local function StartPlayback()
     State.RuntimeHandles = {}
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
     State.PlaceRejects = {}
+    State.SkippedActions = 0
 
     task.spawn(function()
         SetStatus("Playback", string.format("Running %s", State.ProfileName))
@@ -2353,8 +2353,26 @@ local function StartPlayback()
             end
 
             if not success then
-                StopPlayback(string.format("Action %d failed: %s", index, message or "unknown error"))
-                return
+                -- A profile holds hundreds of ability casts. An ability that
+                -- cannot fire right now (cooldown, no target, slot refused)
+                -- used to abort the whole run, which is why playback died a
+                -- few seconds in. These action types are best effort now: log
+                -- the miss and keep going. Only structural failures stop.
+                local soft = action.Type == "Ability"
+                    or action.Type == "Place"
+                    or action.Type == "Upgrade"
+                    or action.Type == "Target"
+                    or action.Type == "Sell"
+
+                if soft then
+                    State.SkippedActions = (State.SkippedActions or 0) + 1
+                    SetStatus("Playback", string.format(
+                        "%d/%d  skip %s: %s",
+                        index, #State.Actions, tostring(action.Type), tostring(message or "?")))
+                else
+                    StopPlayback(string.format("Action %d failed: %s", index, message or "unknown error"))
+                    return
+                end
             end
 
             if index == 1 then
