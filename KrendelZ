@@ -60,6 +60,10 @@ local State = {
     WebhookMatchEnd = true,
     DoorRewards = true,
     Speed = 1,
+    Paused = false,
+    RecordSpeed = true,
+    ClockSource = "",
+    ClockTargets = "",
     PlaybackMode = "Hybrid",
     ProfileName = "",
     ProfileVersion = 4,
@@ -94,6 +98,7 @@ local State = {
     CrystalInterval = 5,
     CrystalCooldown = 60,
     SlenderRun = false,
+    SlenderClick = false,
     SlenderPageDelay = 2,
     SlenderCaveDelay = 5,
     AntiAfk = false,
@@ -915,6 +920,11 @@ local function RefreshActionList()
         local subject = action.Unit or action.Handle or ""
         if action.Type == "BoostLink" then
             subject = string.format("%s > %s", action.SourceHandle or "?", action.TargetHandle or "?")
+        elseif action.Type == "BoostUnlink" then
+            subject = string.format("%s x %s (off)", action.SourceHandle or "?", action.TargetHandle or "?")
+        elseif action.Type == "Speed" then
+            local value = tonumber(action.Speed) or 1
+            subject = value <= 0 and "PAUSE" or ("x" .. tostring(value))
         end
         table.insert(lines, string.format("%02d | W%s | %s | %s", index, action.Wave or 0, action.Type or "?", subject))
     end
@@ -1014,6 +1024,367 @@ Hub.RecordBoostLinkAction = function(sourceId, targetId)
     })
     return true
 end
+
+-- Clock boosts ----------------------------------------------------------------
+-- A Clock links itself to one tower with a single call:
+-- BoostSelect:FireServer(number clockServerId, string targetServerId).
+-- The "pick the clock, pick boost, pick the unit" flow is client-side only -
+-- nothing else goes over the wire, which is why one call is enough here.
+Hub.Clock = {}
+
+function Hub.Clock.Towers()
+    local out = {}
+    if not TowerDataFolder then
+        return out
+    end
+    local me = LocalPlayer.Name
+    for _, tower in ipairs(TowerDataFolder:GetChildren()) do
+        if tower:GetAttribute("Creator") == me then
+            table.insert(out, tower)
+        end
+    end
+    table.sort(out, function(a, b)
+        return (tonumber(a.Name) or 0) < (tonumber(b.Name) or 0)
+    end)
+    return out
+end
+
+function Hub.Clock.IsClock(tower)
+    local id = tostring(tower:GetAttribute("ID") or ""):lower()
+    if id:find("clock", 1, true) then
+        return true
+    end
+    if tower:GetAttribute("TimeSkipCount") ~= nil then
+        return true
+    end
+    for attribute in pairs(tower:GetAttributes()) do
+        if tostring(attribute):find("Timestop", 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+function Hub.Clock.List()
+    local clocks = {}
+    for _, tower in ipairs(Hub.Clock.Towers()) do
+        if Hub.Clock.IsClock(tower) then
+            table.insert(clocks, tower)
+        end
+    end
+    return clocks
+end
+
+function Hub.Clock.Boost(sourceId, targetId)
+    if not Remotes.BoostSelect or not Remotes.BoostSelect:IsA("RemoteEvent") then
+        return false, "BoostSelect is unavailable"
+    end
+    if not TowerDataFolder then
+        return false, "not in a match"
+    end
+    local source = TowerDataFolder:FindFirstChild(tostring(sourceId))
+    local target = TowerDataFolder:FindFirstChild(tostring(targetId))
+    if not source then
+        return false, "clock " .. tostring(sourceId) .. " not found"
+    end
+    if not target then
+        return false, "target " .. tostring(targetId) .. " not found"
+    end
+    if tostring(target:GetAttribute("ClockBoost")) == tostring(source.Name) then
+        return true, "already linked"
+    end
+
+    local ok = pcall(function()
+        Remotes.BoostSelect:FireServer(tonumber(source.Name) or source.Name, tostring(target.Name))
+    end)
+    if not ok then
+        return false, "BoostSelect call failed"
+    end
+
+    local confirmed = WaitUntil(function()
+        return tostring(target:GetAttribute("ClockBoost")) == tostring(source.Name)
+    end, 3, 0.05)
+    return confirmed, confirmed and "linked" or "server did not confirm"
+end
+
+
+function Hub.Clock.BoostMany(sourceId, targetIds)
+    local linked, failed = 0, 0
+    for _, id in ipairs(targetIds) do
+        if tostring(id) ~= tostring(sourceId) then
+            local ok = Hub.Clock.Boost(sourceId, id)
+            if ok then
+                linked = linked + 1
+            else
+                failed = failed + 1
+            end
+            task.wait(0.12)
+        end
+    end
+    return linked, failed
+end
+
+function Hub.Clock.AllIds()
+    local ids = {}
+    for _, tower in ipairs(Hub.Clock.Towers()) do
+        table.insert(ids, tower.Name)
+    end
+    return ids
+end
+
+-- Slender TV passive ----------------------------------------------------------
+-- Every page the tower drops is a UI button: PlayerGui.SlenderTV.PageN
+-- (an ImageButton that lives ~5 s). Clicking one pays DMG, +6% range and
+-- 1 Belief, and Belief 25 opens the domain for 5 waves. The buttons are plain
+-- GuiButtons, so the game's own MouseButton1Click handler can be fired without
+-- touching the mouse or the network.
+Hub.Slender = {}
+Hub.Slender.Clicks = 0
+Hub.Slender.Seen = 0
+Hub.Slender.Running = false
+Hub.Slender.Last = "-"
+Hub.Slender.Mode = "-"
+
+function Hub.Slender.Gui()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    return playerGui and playerGui:FindFirstChild("SlenderTV")
+end
+
+function Hub.Slender.Index(button)
+    return tonumber(tostring(button and button.Name or ""):match("(%d+)"))
+end
+
+-- The tower that owns the passive, so we can read Belief and prove a click
+-- actually landed. Prefer the tower the game has selected, then anything whose
+-- ID says slender.
+function Hub.Slender.Tower()
+    local towerData = TowerDataFolder
+    if not towerData then
+        return nil
+    end
+    local best = nil
+    for _, tower in ipairs(towerData:GetChildren()) do
+        if tostring(tower:GetAttribute("ID") or ""):lower():find("slender") then
+            -- Prefer the one that has actually collected something.
+            if (tonumber(tower:GetAttribute("Belief")) or 0) > 0 then
+                return tower
+            end
+            best = best or tower
+        end
+    end
+    return best
+end
+
+function Hub.Slender.Belief()
+    local tower = Hub.Slender.Tower()
+    if not tower then
+        return nil
+    end
+    return tonumber(tower:GetAttribute("Belief"))
+end
+
+-- Pages are not on a timer. From the unit's own tooltip:
+--
+--   "Enemies in his Static Range build Static. At 100% they can't attack for
+--    4s and a Page appears."
+--
+-- So a page only drops when an enemy survives long enough inside StaticRange
+-- (200 / 250 / 300 / 320 studs by upgrade, +2.5%/s, bosses 5x slower). If the
+-- base kills everything on sight nothing ever reaches 100% and no page shows
+-- up - that is exactly what happened on the first watch. The server pushes the
+-- per-enemy meter down as ("Static", {id, value, id, value, ...}), so we can
+-- show how close the closest enemy is instead of guessing.
+Hub.Slender.Static = {}
+Hub.Slender.MaxStatic = 0
+
+-- The static ring is wider than the attack range, which is the whole trick:
+-- at max level the tower shoots 190 studs but builds Static out to 320, so an
+-- enemy parked in that 130-stud band charges the meter without being killed.
+-- Nothing on the tower object exposes either number, so read them from the
+-- unit's own stats module once and cache the result.
+function Hub.Slender.Ring()
+    if Hub.Slender.RingCache then
+        return Hub.Slender.RingCache[1], Hub.Slender.RingCache[2]
+    end
+    local stats = ReplicatedStorage:FindFirstChild("TowerData")
+    stats = stats and stats:FindFirstChild("Stats")
+    stats = stats and stats:FindFirstChild("slenderTV")
+    if not stats then
+        return nil, nil
+    end
+    local ok, data = pcall(require, stats)
+    if not ok or type(data) ~= "table" or type(data.TowerStats) ~= "table" then
+        return nil, nil
+    end
+    local upgrades = data.TowerStats.UpgradeData
+    if type(upgrades) ~= "table" then
+        return nil, nil
+    end
+    local cache = {}
+    for level, entry in pairs(upgrades) do
+        local attackRange, staticRange = 0, tonumber(entry.StaticRange) or 0
+        if type(entry.Attacks) == "table" then
+            for _, attack in pairs(entry.Attacks) do
+                local rng = tonumber(attack.RNG)
+                if rng and rng > attackRange then attackRange = rng end
+            end
+        end
+        cache[tonumber(level)] = { attackRange, staticRange }
+    end
+    Hub.Slender.RingCache = cache
+    local tower = Hub.Slender.Tower()
+    local level = tower and tonumber(tower:GetAttribute("Upgrade")) or 0
+    local row = cache[level] or cache[0]
+    if not row then
+        return nil, nil
+    end
+    return row[1], row[2]
+end
+
+function Hub.Slender.WatchStatic()
+    if Hub.Slender.StaticConnected then
+        return
+    end
+    local event = ReplicatedStorage:FindFirstChild("SlenderEvent")
+    if not event or not event:IsA("RemoteEvent") then
+        return
+    end
+    Hub.Slender.StaticConnected = true
+    AddConnection(State.Connections, event.OnClientEvent:Connect(function(kind, payload)
+        if kind ~= "Static" or type(payload) ~= "table" then
+            return
+        end
+        local best = 0
+        for index = 1, #payload - 1, 2 do
+            local value = tonumber(payload[index + 1])
+            if value then
+                Hub.Slender.Static[tostring(payload[index])] = value
+                if value > best then best = value end
+            end
+        end
+        if best > Hub.Slender.MaxStatic then
+            Hub.Slender.MaxStatic = best
+        end
+    end))
+end
+
+function Hub.Slender.Click(button)
+    if not button or not button:IsA("GuiButton") then
+        return false
+    end
+
+    -- SlenderClient wires the page to Activated, NOT MouseButton1Click:
+    --
+    --   ImageButton.Activated:Connect(function()
+    --       SlenderEvent:FireServer("Collect", index)
+    --       removePage(index, true)
+    --   end)
+    --
+    -- Firing MouseButton1Click on that button reaches nobody, which is why the
+    -- first version of this counted clicks but never moved Belief.
+    local fired = false
+    local mode = "none"
+
+    if type(getconnections) == "function" then
+        local ok, connections = pcall(getconnections, button.Activated)
+        if ok and type(connections) == "table" and #connections > 0 then
+            for _, connection in ipairs(connections) do
+                pcall(function()
+                    connection:Fire()
+                end)
+            end
+            fired, mode = true, "signal"
+        end
+    end
+
+    if not fired and type(firesignal) == "function" then
+        local ok = pcall(firesignal, button.Activated)
+        if ok then
+            fired, mode = true, "firesignal"
+        end
+    end
+
+    -- Nothing to fire means the executor hid the handler. Fall back to the
+    -- exact packet the game sends on a real click - same remote, same args,
+    -- one call per page, nothing hooked.
+    if not fired then
+        local index = Hub.Slender.Index(button)
+        local event = ReplicatedStorage:FindFirstChild("SlenderEvent")
+        if index and event and event:IsA("RemoteEvent") then
+            local ok = pcall(function()
+                event:FireServer("Collect", index)
+            end)
+            if ok then
+                fired, mode = true, "remote"
+            end
+        end
+    end
+
+    if fired then
+        Hub.Slender.Clicks = Hub.Slender.Clicks + 1
+        Hub.Slender.Last = tostring(button.Name)
+        Hub.Slender.Mode = mode
+    end
+    return fired
+end
+
+function Hub.Slender.Sweep()
+    local gui = Hub.Slender.Gui()
+    if not gui then
+        return 0
+    end
+    local clicked = 0
+    for _, child in ipairs(gui:GetChildren()) do
+        if child:IsA("GuiButton") then
+            if Hub.Slender.Click(child) then
+                clicked = clicked + 1
+            end
+        end
+    end
+    return clicked
+end
+
+function Hub.Slender.Start()
+    if Hub.Slender.Running then
+        return
+    end
+    Hub.Slender.Running = true
+    Hub.Slender.Clicks = 0
+    Hub.Slender.Seen = 0
+    Hub.Slender.Mode = "-"
+    Hub.Slender.MaxStatic = 0
+    Hub.Slender.BeliefStart = Hub.Slender.Belief()
+    Hub.Slender.WatchStatic()
+    Hub.Slender.Thread = task.spawn(function()
+        local handled = setmetatable({}, { __mode = "k" })
+        while Hub.Slender.Running and State.Running do
+            local gui = Hub.Slender.Gui()
+            if gui then
+                for _, child in ipairs(gui:GetChildren()) do
+                    if child:IsA("GuiButton") and not handled[child] then
+                        handled[child] = true
+                        Hub.Slender.Seen = Hub.Slender.Seen + 1
+                        -- The page animates in over 0.25s. It stays clickable
+                        -- for PageLife (5s), so a short beat is plenty.
+                        task.delay(0.15, function()
+                            if Hub.Slender.Running then
+                                Hub.Slender.Click(child)
+                            end
+                        end)
+                    end
+                end
+            end
+            task.wait(0.1)
+        end
+        Hub.Slender.Running = false
+    end)
+end
+
+function Hub.Slender.Stop()
+    Hub.Slender.Running = false
+end
+
+
 
 local function DisableLegacyAbilityRecorderHook()
     local hookState = Environment.KeroSkibidiAbilityHook
@@ -1168,11 +1539,31 @@ local function AttachTowerRecorder(tower, handle)
         local previous = meta.ClockBoost
         local sourceId = tower:GetAttribute("ClockBoost")
         meta.ClockBoost = sourceId
-        if not State.Recording
-            or sourceId == nil
-            or tostring(sourceId) == ""
-            or tostring(sourceId) == "0"
-            or tostring(sourceId) == tostring(previous) then
+        if not State.Recording then
+            return
+        end
+
+        local hadBoost = previous ~= nil and tostring(previous) ~= "" and tostring(previous) ~= "0"
+        local hasBoost = sourceId ~= nil and tostring(sourceId) ~= "" and tostring(sourceId) ~= "0"
+
+        -- Firing the same clock at the same unit a second time removes the
+        -- link - that is how a boost is moved to another unit. The removal has
+        -- to sit in the profile too, otherwise a replay would try to link a
+        -- clock that is still busy with the old target.
+        if hadBoost and not hasBoost then
+            local sourceTower = TowerDataFolder and TowerDataFolder:FindFirstChild(tostring(previous))
+            local sourceMeta = sourceTower and State.TowerMeta[sourceTower]
+            if sourceMeta then
+                AddAction({
+                    Type = "BoostUnlink",
+                    SourceHandle = sourceMeta.Handle,
+                    TargetHandle = meta.Handle,
+                })
+            end
+            return
+        end
+
+        if not hasBoost or tostring(sourceId) == tostring(previous) then
             return
         end
 
@@ -1183,24 +1574,49 @@ local function AttachTowerRecorder(tower, handle)
     end))
 
     AddConnection(State.RecorderConnections, tower.AttributeChanged:Connect(function(attribute)
-        if not tostring(attribute):match("^ATTACK") then
+        local name = tostring(attribute)
+        -- Two kinds of marker, measured live over 50s of idle combat.
+        --
+        -- Quiet ones only move when a cast actually goes off: ATTACK<Name>,
+        -- TimeSkipCount / SkippedTimes, the LOCK / SPAWNLOCK flags behind the
+        -- "Call In" abilities, the Abilities table and AutoAbilityAvailable.
+        -- Not one of them changed in 50s with nobody pressing anything.
+        --
+        -- Noisy ones move during normal combat: StunMark moved 239 times and
+        -- Stun 193 times in 40s because that is enemy CC landing ON the tower,
+        -- and Damage drifts with every boost (7686 changes). Treating those as
+        -- proof of a cast is what produced phantom ability actions, so they
+        -- only count right after the player really clicked an ability button.
+        local quiet = name:match("^ATTACK")
+            or name:match("^TimeSkip")
+            or name == "SkippedTimes"
+            or name:match("^LOCK")
+            or name:match("^SPAWNLOCK")
+            or name == "callingcarrier"
+            or name == "Abilities"
+            or name == "AutoAbilityAvailable"
+        local noisy = name:match("^Stun") or name == "Damage"
+        if not (quiet or noisy) then
             return
         end
 
-        local previous = meta.AbilityMarkers[attribute]
-        local value = tower:GetAttribute(attribute)
-        meta.AbilityMarkers[attribute] = value
-        if not State.Recording
-            or os.clock() - State.PendingAbilityClickAt > 2
-            or previous == value then
+        local previous = meta.AbilityMarkers[name]
+        local value = tower:GetAttribute(name)
+        meta.AbilityMarkers[name] = value
+        if not State.Recording or previous == value then
             return
         end
 
-        local markerIndex = tonumber(tostring(attribute):match("(%d+)$"))
+        local recentClick = os.clock() - State.PendingAbilityClickAt <= 2
+        if noisy and not recentClick then
+            return
+        end
+
+        local markerIndex = tonumber(name:match("(%d+)$"))
         local abilityIndex = markerIndex or State.PendingAbilityIndex or 1
         State.PendingAbilityClickAt = -math.huge
         State.PendingAbilityIndex = 1
-        Hub.RecordAbilityAction(tower, abilityIndex, attribute)
+        Hub.RecordAbilityAction(tower, abilityIndex, name)
     end))
 end
 
@@ -1261,10 +1677,82 @@ local function StartRecording(profileName)
         AddConnection(State.RecorderConnections, playerGui.DescendantAdded:Connect(watchAbilityButton))
     end
 
+    -- Speed and pause. The game freezes when Game.Speed hits 0: every client
+    -- timer is scaled by math.max(Speed.Value, 0), so 0 stops enemies and
+    -- towers alike. We read the replicated NumberValue instead of hooking the
+    -- remote - a hook on the traffic is what gets accounts kicked, and the
+    -- value already tells us exactly what the player pressed.
+    local speedFolder = ReplicatedStorage:FindFirstChild("Game")
+    speedFolder = speedFolder and speedFolder:FindFirstChild("Speed")
+    local speedValue = speedFolder and speedFolder:FindFirstChild("Value")
+    if not speedValue then
+        speedValue = speedFolder
+    end
+    if speedValue and speedValue:IsA("NumberValue") then
+        local lastSpeed = tonumber(speedValue.Value) or 1
+        AddConnection(State.RecorderConnections, speedValue.Changed:Connect(function(value)
+            local speed = tonumber(value) or 1
+            if speed == lastSpeed then
+                return
+            end
+            local previous = lastSpeed
+            lastSpeed = speed
+            if not State.Recording or State.Playing or State.RecordSpeed == false then
+                return
+            end
+            AddAction({
+                Type = "Speed",
+                Speed = speed,
+                FromSpeed = previous,
+            })
+        end))
+    end
+
     local existingOwnTowers = 0
+    local preExisting = {}
     for _, tower in ipairs(TowerDataFolder:GetChildren()) do
         if IsOwnTower(tower) then
             existingOwnTowers = existingOwnTowers + 1
+            table.insert(preExisting, tower)
+        end
+    end
+
+    -- Towers that were already standing when Record was pressed still have to
+    -- end up in the profile. Without a handle for them there is nothing to hang
+    -- an ability or a clock boost on, which is exactly why a manual clock link
+    -- used to record as nothing. They go in as Place actions at time 0.
+    for _, tower in ipairs(preExisting) do
+        local handle = "T" .. State.NextHandle
+        State.NextHandle = State.NextHandle + 1
+        AttachTowerRecorder(tower, handle)
+        local meta = State.TowerMeta[tower]
+        if meta then
+            meta.PlaceRecorded = true
+        end
+        local placement = GetPlacementCFrame(tower)
+        if placement then
+            AddAction({
+                Type = "Place",
+                Handle = handle,
+                Unit = tostring(tower:GetAttribute("ID")),
+                CFrame = CFrameToArray(placement),
+                EstimatedCost = (tonumber(tower:GetAttribute("SellPrice")) or 0) * 2,
+                Wave = 0,
+                RecordedAt = 0,
+            })
+        else
+            SetStatus("Record warning", "Could not read placement CFrame for tower " .. tower.Name)
+        end
+    end
+
+    -- Clock links that are already hanging on those towers count too.
+    for _, tower in ipairs(preExisting) do
+        local sourceId = tower:GetAttribute("ClockBoost")
+        if sourceId ~= nil and tostring(sourceId) ~= "" and tostring(sourceId) ~= "0" then
+            local sourceTower = TowerDataFolder:FindFirstChild(tostring(sourceId))
+            if sourceTower then
+                Hub.RecordBoostLinkAction(sourceTower, tower)
+            end
         end
     end
 
@@ -1596,6 +2084,46 @@ local function PlayTarget(action)
     return tower:GetAttribute("TargetMode") == action.Mode, "Target mode was not confirmed"
 end
 
+local function SpeedValueObject()
+    local gameFolder = ReplicatedStorage:FindFirstChild("Game")
+    local speed = gameFolder and gameFolder:FindFirstChild("Speed")
+    if speed and speed:IsA("NumberValue") then
+        return speed
+    end
+    return nil
+end
+
+local function PlaySpeed(action)
+    local target = math.clamp(math.floor(tonumber(action.Speed) or 1), 0, 6)
+    if not Remotes.Speed or not Remotes.Speed:IsA("RemoteEvent") then
+        return false, "Speed.Change is unavailable"
+    end
+
+    local speedValue = SpeedValueObject()
+    if speedValue and tonumber(speedValue.Value) == target then
+        return true
+    end
+
+    for _ = 1, 8 do
+        if not State.Playing then
+            return false, "Playback stopped while changing speed"
+        end
+        Remotes.Speed:FireServer(target)
+        local confirmed = WaitUntil(function()
+            if not State.Playing then
+                return true
+            end
+            local live = SpeedValueObject()
+            return live ~= nil and tonumber(live.Value) == target
+        end, 1.5, 0.05)
+        if confirmed then
+            return true
+        end
+    end
+
+    return false, target <= 0 and "Pause was not confirmed" or string.format("Speed x%d was not confirmed", target)
+end
+
 local function PlayAbility(action)
     local tower = ResolveHandle(action.Handle)
     if not tower then
@@ -1606,22 +2134,71 @@ local function PlayAbility(action)
     end
 
     local marker = tostring(action.Marker or "")
-    local previous = marker ~= "" and tower:GetAttribute(marker) or nil
     local abilityIndex = tonumber(action.AbilityIndex) or 1
-    local ok, accepted = pcall(
-        Remotes.Ability.InvokeServer,
-        Remotes.Ability,
-        tostring(tower.Name),
-        abilityIndex
-    )
-    if not ok then return false, "Ability request failed: " .. tostring(accepted) end
-    if accepted == false then return false, "Ability was rejected" end
-    if marker == "" then return true end
+    local previous = marker ~= "" and tower:GetAttribute(marker) or nil
 
-    local confirmed = WaitUntil(function()
-        return tower.Parent ~= TowerDataFolder or tower:GetAttribute(marker) ~= previous
-    end, 5, 0.05)
-    return confirmed, confirmed and nil or "Ability was not confirmed"
+    -- Try the recorded slot first, then the remaining low slots. Some towers
+    -- expose a single ability and answer only to slot 1, and a rejected call
+    -- simply returns false, so walking the list is safe and cheap.
+    local order = { abilityIndex }
+    for index = 1, 3 do
+        if index ~= abilityIndex then
+            table.insert(order, index)
+        end
+    end
+
+    local lastError = "Ability request failed"
+    for _, slot in ipairs(order) do
+        if not State.Playing then
+            return false, "Playback stopped while casting"
+        end
+        local ok, accepted = pcall(
+            Remotes.Ability.InvokeServer,
+            Remotes.Ability,
+            tostring(tower.Name),
+            slot
+        )
+        if ok and accepted == true then
+            if marker == "" then
+                return true
+            end
+            local confirmed = WaitUntil(function()
+                return tower.Parent ~= TowerDataFolder or tower:GetAttribute(marker) ~= previous
+            end, 1.2, 0.05)
+            if confirmed then
+                return true
+            end
+        elseif ok then
+            lastError = "Ability slot " .. tostring(slot) .. " was rejected"
+        else
+            lastError = "Ability request failed: " .. tostring(accepted)
+        end
+    end
+
+    return false, lastError
+end
+
+local function PlayBoostUnlink(action)
+    local sourceTower = ResolveHandle(action.SourceHandle)
+    local targetTower = ResolveHandle(action.TargetHandle)
+    if not sourceTower or not targetTower then
+        return true
+    end
+
+    -- The game has no "remove boost" call: a clock keeps its target until it
+    -- is pointed at another unit, and that move is what clears the old one.
+    -- So a recorded removal is informational - the next BoostLink does the
+    -- real work. Never fail playback on it.
+    if tostring(targetTower:GetAttribute("ClockBoost")) ~= tostring(sourceTower.Name) then
+        return true
+    end
+    if Remotes.BoostSelect and Remotes.BoostSelect:IsA("RemoteEvent") then
+        pcall(function()
+            Remotes.BoostSelect:FireServer(tonumber(sourceTower.Name) or sourceTower.Name, tostring(targetTower.Name))
+        end)
+    end
+    task.wait(0.1)
+    return true
 end
 
 local function PlayBoostLink(action)
@@ -1741,8 +2318,12 @@ local function StartPlayback()
                 end
             elseif action.Type == "Ability" then
                 success, message = PlayAbility(action)
+            elseif action.Type == "Speed" then
+                success, message = PlaySpeed(action)
             elseif action.Type == "BoostLink" then
                 success, message = PlayBoostLink(action)
+            elseif action.Type == "BoostUnlink" then
+                success, message = PlayBoostUnlink(action)
             else
                 success, message = false, "Unknown action type: " .. tostring(action.Type)
             end
@@ -1855,11 +2436,19 @@ task.spawn(function()
             pcall(function() Remotes.Skip:FireServer(true) end)
         end
 
+        -- Auto Speed must stay out of the way while recording: it re-fires
+        -- FireServer(State.Speed) every SpeedScaleDelay seconds, so the moment
+        -- the player hits pause the hub would undo it a second later and the
+        -- recorder would see 4 -> 0 -> 4 -> 0 forever. A recorded pause could
+        -- never survive with this running.
         local speedEligible = State.AutoSpeed
             and macroAutomationReady
             and matchReady
             and Remotes.Speed
             and not ended
+            and not State.Paused
+            and not State.Playing
+            and not State.Recording
 
         if speedEligible then
             if speedReadySince == nil then
@@ -24214,8 +24803,7 @@ recordToggle = StatusBox:AddToggle("Record", "Captures tower placements and abil
     end
 end)
 
-playbackToggle = StatusBox:AddToggle("Playback", "Arms the saved profile for automatic playback", State.PlaybackEnabled, function(value)
-    if changingToggle then return end
+playbackToggle = StatusBox:AddToggle("Playback", "Arms the saved profile for automatic playback", State.PlaybackEnabled, function(value)    if changingToggle then return end
     State.PlaybackEnabled = value == true
     QueueSave()
     if value then
@@ -24230,6 +24818,11 @@ playbackToggle = StatusBox:AddToggle("Playback", "Arms the saved profile for aut
     elseif State.Playing then
         StopPlayback("Stopped by user")
     end
+end)
+
+StatusBox:AddToggle("Record Speed / Pause", "Writes every x1-x6 press and every pause into the macro", State.RecordSpeed ~= false, function(value)
+    State.RecordSpeed = value == true
+    QueueSave()
 end)
 
 -- Misc ------------------------------------------------------------------------
@@ -24645,6 +25238,23 @@ Gui.SlenderBox:AddSlider("Delay Cave -> Slenderman", 1, 20, State.SlenderCaveDel
     QueueSave()
 end)
 Gui.SlenderStatus = MakeInfoRow(Gui.SlenderBox, "Pages: 0/12", "Idle", StarHubUI.Icons.Save)
+Gui.SlenderBox:AddToggle("Auto Click Slender Pages",
+    "Pages appear when an enemy hits 100% Static in his range - each click gives DMG, +6% Range and 1 Belief",
+    State.SlenderClick, function(value)
+    State.SlenderClick = value == true
+    if State.SlenderClick then
+        Hub.Slender.Start()
+    else
+        Hub.Slender.Stop()
+    end
+    QueueSave()
+end)
+Gui.SlenderClickStatus = MakeInfoRow(Gui.SlenderBox, "TV pages: 0 seen | 0 clicked",
+    "Belief 25 opens the domain for 5 waves", StarHubUI.Icons.Zap)
+Gui.SlenderBox:AddActionRow("Click Pages Now", "Sweeps whatever is on screen this second", StarHubUI.Icons.Zap, function()
+    local clicked = Hub.Slender.Sweep()
+    Notify("Slender", clicked > 0 and ("clicked " .. clicked .. " page(s)") or "no page on screen")
+end)
 Gui.SlenderBox:AddActionRow("Scan Pages", "Shows how many pages the walk found and where", StarHubUI.Icons.Search, function()
     task.spawn(function()
         local total, where = 0, "не найдено"
@@ -24683,6 +25293,84 @@ Gui.SlenderBox:AddActionRow("Teleport To Slenderman", "Only the second half of t
     root.AssemblyLinearVelocity = Vector3.zero
     Notify("Slender", "slenderman")
 end)
+
+local ClockBox = FarmTab:CreateGroupBox("Right", "Clock Boost", "CLOCKS", StarHubUI.Icons.Zap)
+ClockBox:AddInput("Clock ID", "server id of the clock, e.g. 19", "", function(value)
+    State.ClockSource = tostring(value or "")
+    QueueSave()
+end)
+ClockBox:AddInput("Targets", "ids split by comma, or all", "", function(value)
+    State.ClockTargets = tostring(value or "")
+    QueueSave()
+end)
+ClockBox:AddActionRow("Use My Clock", "Fills Clock ID with the first clock unit it finds", StarHubUI.Icons.Search, function()
+    local clocks = Hub.Clock.List()
+    if #clocks == 0 then
+        Notify("Clock Boost", "no clock unit found")
+        return
+    end
+    State.ClockSource = tostring(clocks[1].Name)
+    Notify("Clock Boost", string.format("clock %s (%s)", clocks[1].Name,
+        tostring(clocks[1]:GetAttribute("ID") or "?")))
+end)
+ClockBox:AddActionRow("Boost Targets", "Links the clock to the ids in Targets", StarHubUI.Icons.Zap, function()
+    local source = tostring(State.ClockSource or "")
+    if source == "" then
+        Notify("Clock Boost", "set Clock ID first")
+        return
+    end
+    local ids = {}
+    local raw = tostring(State.ClockTargets or "")
+    if raw == "" or raw:lower() == "all" then
+        ids = Hub.Clock.AllIds()
+    else
+        for piece in string.gmatch(raw, "[^,%s]+") do
+            table.insert(ids, piece)
+        end
+    end
+    if #ids == 0 then
+        Notify("Clock Boost", "no targets")
+        return
+    end
+    task.spawn(function()
+        local linked, failed = Hub.Clock.BoostMany(source, ids)
+        Notify("Clock Boost", string.format("clock %s -> %d linked, %d failed", source, linked, failed))
+    end)
+end)
+ClockBox:AddActionRow("Boost ALL My Units", "Links the clock to every unit you own", StarHubUI.Icons.Check, function()
+    local source = tostring(State.ClockSource or "")
+    if source == "" then
+        Notify("Clock Boost", "set Clock ID first")
+        return
+    end
+    task.spawn(function()
+        local linked, failed = Hub.Clock.BoostMany(source, Hub.Clock.AllIds())
+        Notify("Clock Boost", string.format("clock %s -> %d linked, %d failed", source, linked, failed))
+    end)
+end)
+ClockBox:AddActionRow("Where Is My Boost", "Prints every unit that currently carries a clock", StarHubUI.Icons.Search, function()
+    local lines = {}
+    for _, tower in ipairs(Hub.Clock.Towers()) do
+        local boost = tower:GetAttribute("ClockBoost")
+        if boost ~= nil and tostring(boost) ~= "" and tostring(boost) ~= "0" then
+            table.insert(lines, string.format("%s <- clock %s", tower.Name, tostring(boost)))
+        end
+    end
+    Notify("Clock Boost", #lines > 0 and table.concat(lines, " | ") or "no unit is boosted")
+end)
+ClockBox:AddActionRow("List Clocks", "Prints every clock and what it is linked to", StarHubUI.Icons.Dashboard, function()
+    local clocks = Hub.Clock.List()
+    if #clocks == 0 then
+        Notify("Clock Boost", "no clock unit found")
+        return
+    end
+    local lines = {}
+    for _, tower in ipairs(clocks) do
+        table.insert(lines, string.format("%s (%s)", tower.Name, tostring(tower:GetAttribute("ID") or "?")))
+    end
+    Notify("Clock Boost", table.concat(lines, ", "))
+end)
+Gui.ClockStatus = MakeInfoRow(ClockBox, "Clock Boost: idle", "pick a clock, then boost", StarHubUI.Icons.Zap)
 
 local FarmUtilBox = FarmTab:CreateGroupBox("Right", "Utility", "AFK", StarHubUI.Icons.Check)
 FarmUtilBox:AddToggle("Anti-AFK", "Captures the controller and clicks when Roblox counts you as idle", State.AntiAfk, function(value)
@@ -25166,10 +25854,41 @@ FarmStatusListener = function()
         Gui.CrystalFarmStatus:SetTitle("Crystals found: " .. tostring(Farm.CrystalCount))
         Gui.CrystalFarmStatus:SetDesc(tostring(Farm.CrystalMessage or "Idle"))
     end
+    if Gui.ClockStatus and Hub.Clock then
+        local clocks = Hub.Clock.List()
+        local linked, total = 0, 0
+        for _, tower in ipairs(Hub.Clock.Towers()) do
+            total = total + 1
+            local boost = tower:GetAttribute("ClockBoost")
+            if boost ~= nil and tostring(boost) ~= "" and tostring(boost) ~= "0" then
+                linked = linked + 1
+            end
+        end
+        Gui.ClockStatus:SetTitle(string.format("Clocks: %d | boosted units %d/%d", #clocks, linked, total))
+        Gui.ClockStatus:SetDesc(#clocks > 0
+            and string.format("clock %s ready - Boost Targets to link", tostring(clocks[1].Name))
+            or "no clock unit in this match")
+    end
     if Gui.SlenderStatus then
         Gui.SlenderStatus:SetTitle("Pages: " .. tostring(Farm.SlenderDone or 0) .. "/"
             .. tostring(Farm.SlenderFound or 0) .. (Farm.SlenderRunning and " | running" or ""))
         Gui.SlenderStatus:SetDesc(tostring(Farm.SlenderMessage or "Idle"))
+    end
+    if Gui.SlenderClickStatus and Hub.Slender then
+        local live = Hub.Slender.Gui()
+        local belief = Hub.Slender.Belief()
+        Gui.SlenderClickStatus:SetTitle(string.format("TV pages: %d seen | %d clicked | Belief %s",
+            Hub.Slender.Seen or 0, Hub.Slender.Clicks or 0,
+            belief and tostring(belief) or "-"))
+        local attackRange, staticRange = Hub.Slender.Ring()
+        Gui.SlenderClickStatus:SetDesc(Hub.Slender.Running
+            and (string.format("static %d%% | %s on screen | %s",
+                math.floor(tonumber(Hub.Slender.MaxStatic) or 0),
+                live and tostring(#live:GetChildren()) or "?",
+                (attackRange and staticRange)
+                    and string.format("safe ring %d-%d studs", attackRange, staticRange)
+                    or ("via " .. tostring(Hub.Slender.Mode or "-"))))
+            or "off")
     end
     if Gui.AutoLoadStatus and Hub.AutoLoad then
         local hasSource = Hub.AutoLoad.GetSource() ~= ""
@@ -25212,6 +25931,12 @@ if State.SlenderRun then
     task.defer(function()
         task.wait(1)
         task.spawn(Farm.SlenderRun)
+    end)
+end
+if State.SlenderClick then
+    task.defer(function()
+        task.wait(1)
+        if Hub.Slender then Hub.Slender.Start() end
     end)
 end
 if State.AutoLoad then
@@ -26062,6 +26787,9 @@ function Hub.Destroy()
     if Hub.Items and type(Hub.Items.Stop) == "function" then
         pcall(Hub.Items.Stop)
     end
+    if Hub.Slender and type(Hub.Slender.Stop) == "function" then
+        pcall(Hub.Slender.Stop)
+    end
     State.Running = false
     State.Recording = false
     State.Playing = false
@@ -26074,6 +26802,16 @@ function Hub.Destroy()
             Window:Destroy()
         elseif Window and Window.ScreenGui then
             Window.ScreenGui:Destroy()
+        end
+    end)
+    -- The minimizer is its own ScreenGui in CoreGui and Window:Destroy leaves
+    -- it behind. Reloading the hub a few times piled up five of those little
+    -- buttons on screen.
+    pcall(function()
+        for _, child in ipairs(game:GetService("CoreGui"):GetChildren()) do
+            if child.Name == "FluentMinimizerGui" then
+                child:Destroy()
+            end
         end
     end)
     if Environment.SkibidiDefenseHub == Hub then
