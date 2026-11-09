@@ -21103,9 +21103,8 @@ do
         MaxFails = 2,
         LastAnswerAt = 0,
         Watchdog = false,
-        SilentStrikes = 0,
-        MaxSilent = 6,
         BalanceWait = false,
+        LastOpenAt = 0,
     }
 
     local VimService = nil
@@ -21868,7 +21867,6 @@ do
 
     function Crates.MarkAnswer()
         Crates.LastAnswerAt = os.clock()
-        Crates.SilentStrikes = 0
         if Crates.BalanceWait then
             Crates.BalanceWait = false
             Report("auto: balance is back - resuming")
@@ -21910,34 +21908,39 @@ do
                 task.wait(0.35)
                 if not Crates.AutoRunning then
                     Crates.LastAnswerAt = os.clock()
+                    Crates.BalanceWait = false
                 else
-                    -- With Instant Skip the answer lands in ~0.15 s; without it
-                    -- the shard animation runs, so the patience has to match.
-                    -- Once the balance is gone there is nothing to wait for, so
-                    -- the retry drops to one try every 10 s.
-                    local strikes = Crates.SilentStrikes or 0
-                    local patience = (strikes >= (Crates.MaxSilent or 6))
-                        and 10
-                        or (Crates.Skip and 3 or 10)
-                    if os.clock() - (Crates.LastAnswerAt or 0) > patience then
+                    -- How long one crate may stay silent. With Instant Skip
+                    -- the answer lands in ~0.15 s, so two seconds is already
+                    -- generous; without it the shard animation runs. Short
+                    -- patience matters: with fourteen crates in the list one
+                    -- dead type must not stall the whole rotation.
+                    -- Two clocks on purpose: LastAnswerAt only moves when the
+                    -- server replies, LastOpenAt on every try. Using one clock
+                    -- for both meant the silence never aged, so the
+                    -- wait-for-balance branch could never arm.
+                    local now = os.clock()
+                    local sinceAnswer = now - (Crates.LastAnswerAt or 0)
+                    local sinceTry = now - (Crates.LastOpenAt or 0)
+                    local nothingFor = sinceAnswer > 30
+                    if nothingFor ~= Crates.BalanceWait then
+                        Crates.BalanceWait = nothingFor
+                        Report(nothingFor
+                            and "auto: nothing answers - waiting for balance, resumes on its own"
+                            or "auto: answers are back - resuming")
+                    end
+                    local patience = nothingFor and 10 or (Crates.Skip and 2 or 10)
+                    if sinceTry > patience then
                         local stuck = Crates.LastKind
                         if stuck then
                             Crates.Fails[stuck] = (Crates.Fails[stuck] or 0) + 1
                             Report(string.format(
-                                "auto: %s did not answer (%d/%d) - skipping it",
+                                "auto: %s did not answer (%d/%d)",
                                 tostring(stuck), Crates.Fails[stuck], Crates.MaxFails or 2))
                         end
-                        Crates.LastAnswerAt = os.clock()
-                        Crates.SilentStrikes = (Crates.SilentStrikes or 0) + 1
-                        if Crates.SilentStrikes == (Crates.MaxSilent or 6) and not Crates.BalanceWait then
-                            -- Six silent tries in a row means the balance is
-                            -- gone. Do not switch auto off - the toggle stays
-                            -- on and the retry slows down, so the run resumes
-                            -- by itself once there is something to spend.
-                            -- This is exactly what used to need a re-toggle.
-                            Crates.BalanceWait = true
-                            Report("auto: waiting for balance - resumes on its own")
-                        end
+                        -- Reset the try clock before firing, otherwise the
+                        -- next tick would count the same try twice.
+                        Crates.LastOpenAt = os.clock()
                         if Crates.AutoRunning then
                             local kind = Crates.NextKind()
                             if kind then
@@ -21974,10 +21977,10 @@ do
             return
         end
         Crates.Fails = {}
-        Crates.SilentStrikes = 0
         Crates.BalanceWait = false
         Crates.KindIndex = 0
         Crates.LastAnswerAt = os.clock()
+        Crates.LastOpenAt = os.clock()
         Crates.StartWatchdog()
         local kind = Crates.NextKind()
         if kind then
