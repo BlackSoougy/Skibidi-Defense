@@ -28651,23 +28651,30 @@ do
         if not fire then
             return false
         end
+        -- Only fire while actually seated on the carrier. Setting the
+        -- CarrierGunner attribute by hand would be worse than useless: the
+        -- tower placement input handler bails out whenever it is set.
+        local scenario = EP.Scripted() and EP.Scripted():FindFirstChild("ScenarioCarrier")
+        local seated = EP.LP:GetAttribute("CarrierGunner")
+            or (scenario and scenario:GetAttribute("Phase") == "Patrol")
+        if not seated then
+            return false
+        end
         local target = EP.NearestEnemy()
         if not target then
             return false
         end
-        if not EP.GunClaimed then
+        local now = os.clock()
+        if not EP.GunClaimed or now - (EP.ClaimAt or 0) > 12 then
             EP.GunClaimed = true
+            EP.ClaimAt = now
             pcall(function()
-                -- The gunner client sets this flag itself on entry; the server
-                -- uses it to tell who is allowed to fire.
-                EP.LP:SetAttribute("CarrierGunner", true)
                 local control = EP.Remote("Control")
                 if control then
                     control:FireServer("Claim", 2)
                 end
             end)
         end
-        local now = os.clock()
         local fired = false
         for index, cooldown in ipairs(EP.GunCooldowns) do
             if now >= (EP.NextFire[index] or 0) then
@@ -28711,6 +28718,13 @@ do
         if s and (s:FindFirstChild("WODBoss") or s:FindFirstChild("DuchessBoss")) then
             return "Boss"
         end
+        -- The gunner client boots itself as soon as ScenarioCarrier hits the
+        -- Patrol phase and stays seated until the finale, so that is the real
+        -- "on the carrier" signal - not the wave count.
+        local scenario = s and s:FindFirstChild("ScenarioCarrier")
+        if scenario and scenario:GetAttribute("Phase") == "Patrol" then
+            return "Carrier"
+        end
         if #EP.FlakMarks() > 0 then
             return "Flak"
         end
@@ -28736,14 +28750,17 @@ do
         end
         local phase = EP.Phase()
         EP.PhaseName = phase
+        -- The carrier guns are under us from the first wave until the finale,
+        -- so they fire in every phase instead of only during the boss.
+        if EP.Gun then
+            pcall(EP.AutoFire)
+        end
         if phase == "Boss" then
             if EP.Repair then pcall(EP.RepairStations) end
             if EP.Dodge then pcall(EP.DodgeDuchess) end
             if EP.Move then pcall(EP.Strafe) end
-            if EP.Gun then pcall(EP.AutoFire) end
-        elseif phase == "Flak" then
-            if EP.Steer then pcall(EP.SteerFlak) end
-            if EP.Gun then pcall(EP.AutoFire) end
+        elseif phase == "Flak" or phase == "Carrier" then
+            if EP.Steer then pcall(EP.SteerAway) end
         end
     end
 
