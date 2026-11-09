@@ -28326,44 +28326,43 @@ do
     end
 
     ------------------------------------------------------------------
-    -- Duchess laser
+    -- Threat map
     ------------------------------------------------------------------
-    -- She fires straight down through her own X/Z, so the dodge is purely
-    -- horizontal: step away from her column while the beam is live.
-    function EP.DodgeDuchess()
+    -- Flak bursts and the laser volley are the same problem: something is
+    -- about to be where the carrier is. The laser fires two lanes (either two
+    -- X columns spanning all Y, or two Y rows spanning all X), so pushing away
+    -- from whatever is closest naturally lands in the free lane.
+    function EP.Threats()
         local s = EP.Scripted()
-        local boss = s and s:FindFirstChild("DuchessBoss")
-        if not boss then
+        if not s then
+            return {}
+        end
+        local list = {}
+        for _, child in ipairs(s:GetChildren()) do
+            if child:IsA("BasePart") then
+                if child.Name == "FlakMark" or child.Name == "FlakCore" then
+                    list[#list + 1] = child.Position
+                elseif child.Name:find("Laser") then
+                    list[#list + 1] = child.Position
+                end
+            elseif child.Name:find("Laser") then
+                local ok, pivot = pcall(function()
+                    return child:GetPivot().Position
+                end)
+                if ok and pivot then
+                    list[#list + 1] = pivot
+                end
+            end
+        end
+        return list
+    end
+
+    -- Kept under the old name so the toggle keeps working.
+    function EP.DodgeDuchess()
+        if EP.NoLookActive then
             return false
         end
-        if boss:GetAttribute("Phase") ~= "Pass" then
-            return false
-        end
-        local now = EP.Clock()
-        local passClock = boss:GetAttribute("PassClock") or now
-        local passTime = boss:GetAttribute("PassTime") or 5
-        local fireAt = boss:GetAttribute("FireAt") or 0
-        if now < passClock + fireAt or now > passClock + passTime then
-            return false
-        end
-        local root = EP.Root()
-        if not root then
-            return false
-        end
-        local ok, pivot = pcall(function() return boss:GetPivot().Position end)
-        if not ok then
-            return false
-        end
-        local away = Vector3.new(root.Position.X - pivot.X, 0, root.Position.Z - pivot.Z)
-        if away.Magnitude < 1 then
-            away = Vector3.new(1, 0, 0)
-        end
-        local target = root.Position + away.Unit * 70
-        local hum = EP.Humanoid()
-        if hum then
-            pcall(function() hum:MoveTo(target) end)
-        end
-        return true
+        return EP.SteerAway()
     end
 
     ------------------------------------------------------------------
@@ -28456,7 +28455,7 @@ do
         return t:GetChildren()[1]
     end
 
-    function EP.SteerFlak()
+    function EP.SteerAway()
         local steer = EP.Remote("Steer")
         if not steer then
             return false
@@ -28473,8 +28472,8 @@ do
         local right = pivot.RightVector
         local flatRight = Vector3.new(right.X, 0, right.Z)
         local steerX, steerY = 0, 0
-        for _, mark in ipairs(EP.FlakMarks()) do
-            local delta = pos - mark.Position
+        for _, point in ipairs(EP.Threats()) do
+            local delta = pos - point
             local flat = Vector3.new(delta.X, 0, delta.Z)
             local dist = flat.Magnitude
             if dist > 1 and dist < 280 then
@@ -28489,8 +28488,26 @@ do
             pcall(function()
                 steer:FireServer(vector, false)
             end)
+            -- The client's own steering loop re-reads the mouse every 0.2 s and
+            -- would overwrite anything we send. Moving the real cursor makes the
+            -- game produce the same input by itself, so both agree.
+            local cam = workspace.CurrentCamera
+            if cam then
+                local size = cam.ViewportSize
+                pcall(function()
+                    mousemoveabs(
+                        size.X / 2 + vector.X * size.X * 0.25,
+                        size.Y / 2 - vector.Y * size.Y * 0.25
+                    )
+                end)
+            end
         end
         return true
+    end
+
+    -- Old name kept as an alias; both phases now go through SteerAway.
+    function EP.SteerFlak()
+        return EP.SteerAway()
     end
 
     ------------------------------------------------------------------
@@ -28606,6 +28623,11 @@ do
     -- Slam and Blast both target the player's position, so standing still is
     -- what kills you. Strafing around the base keeps the aim point moving.
     function EP.Strafe()
+        -- While manning the carrier there is no ground character to walk, and
+        -- MoveTo would fight the seat. Steering owns movement in that phase.
+        if EP.LP:GetAttribute("CarrierGunner") then
+            return false
+        end
         local root = EP.Root()
         local hum = EP.Humanoid()
         if not (root and hum) then
