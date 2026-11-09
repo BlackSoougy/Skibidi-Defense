@@ -21105,6 +21105,7 @@ do
         Watchdog = false,
         SilentStrikes = 0,
         MaxSilent = 6,
+        BalanceWait = false,
     }
 
     local VimService = nil
@@ -21868,6 +21869,10 @@ do
     function Crates.MarkAnswer()
         Crates.LastAnswerAt = os.clock()
         Crates.SilentStrikes = 0
+        if Crates.BalanceWait then
+            Crates.BalanceWait = false
+            Report("auto: balance is back - resuming")
+        end
         if Crates.LastKind then
             Crates.Fails[Crates.LastKind] = nil
         end
@@ -21908,7 +21913,12 @@ do
                 else
                     -- With Instant Skip the answer lands in ~0.15 s; without it
                     -- the shard animation runs, so the patience has to match.
-                    local patience = Crates.Skip and 3 or 10
+                    -- Once the balance is gone there is nothing to wait for, so
+                    -- the retry drops to one try every 10 s.
+                    local strikes = Crates.SilentStrikes or 0
+                    local patience = (strikes >= (Crates.MaxSilent or 6))
+                        and 10
+                        or (Crates.Skip and 3 or 10)
                     if os.clock() - (Crates.LastAnswerAt or 0) > patience then
                         local stuck = Crates.LastKind
                         if stuck then
@@ -21919,13 +21929,14 @@ do
                         end
                         Crates.LastAnswerAt = os.clock()
                         Crates.SilentStrikes = (Crates.SilentStrikes or 0) + 1
-                        if Crates.SilentStrikes >= (Crates.MaxSilent or 6) then
-                            -- Nothing answered for six tries in a row: the
-                            -- server is refusing everything (no balance), so
-                            -- hammering it further would only burn the rest.
-                            Crates.AutoRunning = false
-                            Report("auto stopped - the server stopped answering, out of balance?")
-                            return
+                        if Crates.SilentStrikes == (Crates.MaxSilent or 6) and not Crates.BalanceWait then
+                            -- Six silent tries in a row means the balance is
+                            -- gone. Do not switch auto off - the toggle stays
+                            -- on and the retry slows down, so the run resumes
+                            -- by itself once there is something to spend.
+                            -- This is exactly what used to need a re-toggle.
+                            Crates.BalanceWait = true
+                            Report("auto: waiting for balance - resumes on its own")
                         end
                         if Crates.AutoRunning then
                             local kind = Crates.NextKind()
@@ -21964,6 +21975,7 @@ do
         end
         Crates.Fails = {}
         Crates.SilentStrikes = 0
+        Crates.BalanceWait = false
         Crates.KindIndex = 0
         Crates.LastAnswerAt = os.clock()
         Crates.StartWatchdog()
