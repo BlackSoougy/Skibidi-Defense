@@ -27921,7 +27921,7 @@ do
     -- has its own UpgradeData table (Brute tops out at 4, Strider at 3,
     -- MafiaMutant at 2), so hardcoding one number was wrong.
     EP.MaxLevel = 4
-    EP.PerUnit = 4
+    EP.Limits = {}
     EP.Slots = {
         { Unit = "ArmadaBrute", Limit = 3 },
         { Unit = "ArmadaSpeakerwoman", Limit = 1 },
@@ -28036,7 +28036,8 @@ do
 
     -- Which units this chapter actually offers comes from the game, not from a
     -- guess: Event.getTowers returns the live list (4 Armada units plus the
-    -- three toilets/mutants the base prep unlocks).
+    -- three toilets/mutants the base prep unlocks). A failed lookup is never
+    -- cached - the hub is usually loaded in the lobby, before the map exists.
     function EP.UnitList()
         if EP.Units and #EP.Units > 0 then
             return EP.Units
@@ -28056,16 +28057,19 @@ do
                 end
             end
         end
-        if #list == 0 then
-            for _, slot in ipairs(EP.Slots) do
-                list[#list + 1] = slot.Unit
-            end
+        if #list > 0 then
+            EP.Units = list
+            return list
         end
-        EP.Units = list
+        for _, slot in ipairs(EP.Slots) do
+            list[#list + 1] = slot.Unit
+        end
         return list
     end
 
-    -- Max level per unit, taken from the stats module's UpgradeData keys.
+    -- Max level per unit, taken from the stats module's UpgradeData keys. Only
+    -- cached once a real module was found - caching the fallback would freeze
+    -- every unit at the default level for the whole session.
     function EP.MaxLevelOf(unit)
         local cached = EP.MaxLevels[unit]
         if cached then
@@ -28087,11 +28091,51 @@ do
                 end
                 if best > 0 then
                     level = best
+                    EP.MaxLevels[unit] = level
                 end
             end
         end
-        EP.MaxLevels[unit] = level
         return level
+    end
+
+    -- How many of a unit the chapter allows. TowerStats.Limit is the real cap:
+    -- Brute 3, Speakerwoman 1, Strider 1, Large 2, and 1 of each toilet - ten
+    -- units in total. Guessing one number for all of them was wrong.
+    function EP.LimitOf(unit)
+        local cached = EP.Limits[unit]
+        if cached then
+            return cached
+        end
+        local stats = EP.RS:FindFirstChild("TowerData")
+        stats = stats and stats:FindFirstChild("Stats")
+        local module = stats and stats:FindFirstChild(unit)
+        local limit = nil
+        if module then
+            local ok, data = pcall(require, module)
+            if ok and type(data) == "table" and type(data.TowerStats) == "table" then
+                limit = tonumber(data.TowerStats.Limit)
+            end
+        end
+        if limit then
+            EP.Limits[unit] = limit
+            return limit
+        end
+        -- No stats module yet: use the known Armada split rather than assuming 1,
+        -- which would under-deploy the whole squad.
+        for _, slot in ipairs(EP.Slots) do
+            if slot.Unit == unit then
+                return slot.Limit
+            end
+        end
+        return 1
+    end
+
+    function EP.TotalLimit()
+        local total = 0
+        for _, unit in ipairs(EP.UnitList()) do
+            total = total + EP.LimitOf(unit)
+        end
+        return total
     end
 
     -- The floor slab is thin and rotated, so the only trustworthy height is a
@@ -28157,46 +28201,66 @@ do
     -- Walks a spiral of candidate points across the pad. The server silently
     -- drops spots that overlap blockers or exceed the unit cap, so a run of
     -- misses means "stop trying this unit" rather than "keep hammering".
+    -- Grid of candidate spots across the pad, ordered centre-first. Spacing is
+    -- 22 studs because the big units need room to not overlap each other.
+    function EP.Candidates()
+        local bounds = EP.FloorBounds()
+        if not bounds then
+            return nil
+        end
+        local list = {}
+        for ring = 0, 7 do
+            for dx = -ring, ring do
+                for dz = -ring, ring do
+                    if math.abs(dx) == ring or math.abs(dz) == ring then
+                        local x = bounds.Center.X + dx * 22
+                        local z = bounds.Center.Z + dz * 22
+                        if math.abs(x - bounds.Center.X) <= bounds.HalfX - 16
+                            and math.abs(z - bounds.Center.Z) <= bounds.HalfZ - 16 then
+                            list[#list + 1] = { x = x, z = z }
+                        end
+                    end
+                end
+            end
+        end
+        return list
+    end
+
     function EP.PlaceAll()
         local bounds = EP.FloorBounds()
         if not bounds then
             return false, "no placement floor"
         end
         EP.AttachPlace()
+        -- One shared candidate list walked front to back. Placed units take up
+        -- space, so the cursor naturally drifts outward instead of every unit
+        -- re-testing the centre and burning its miss budget there.
+        local list = EP.Candidates()
+        if not list then
+            return false, "no candidates"
+        end
         local units = EP.UnitList()
-        local placed, tries = 0, 0
+        local cursor, placed, tries = 1, 0, 0
         for _, unit in ipairs(units) do
+            local limit = EP.LimitOf(unit)
             local got, misses = 0, 0
-            for ring = 0, 5 do
-                if misses >= 3 or got >= EP.PerUnit then
-                    break
-                end
-                for dx = -ring, ring do
-                    for dz = -ring, ring do
-                        if misses < 3 and got < EP.PerUnit
-                            and (math.abs(dx) == ring or math.abs(dz) == ring) then
-                            local x = bounds.Center.X + dx * 26
-                            local z = bounds.Center.Z + dz * 26
-                            if math.abs(x - bounds.Center.X) <= bounds.HalfX - 18
-                                and math.abs(z - bounds.Center.Z) <= bounds.HalfZ - 18 then
-                                tries = tries + 1
-                                if EP.TryPlace(unit, x, z) then
-                                    placed = placed + 1
-                                    got = got + 1
-                                    misses = 0
-                                else
-                                    misses = misses + 1
-                                end
-                            end
-                        end
-                    end
+            while got < limit and misses < 4 and cursor <= #list do
+                local point = list[cursor]
+                cursor = cursor + 1
+                tries = tries + 1
+                if EP.TryPlace(unit, point.x, point.z) then
+                    placed = placed + 1
+                    got = got + 1
+                    misses = 0
+                else
+                    misses = misses + 1
                 end
             end
             if got > 0 then
-                EP.SetStatus(string.format("deployed %s x%d", unit, got))
+                EP.SetStatus(string.format("%s x%d", unit, got))
             end
         end
-        EP.SetStatus(string.format("deployed %d units (%d tries)", placed, tries))
+        EP.SetStatus(string.format("deployed %d/%d units", placed, EP.TotalLimit()))
         return placed > 0, placed
     end
 
@@ -28690,7 +28754,9 @@ do
         local phase = EP.Phase()
         EP.PhaseName = phase
         if phase == "Waves" or phase == "Prep" or phase == "Boss" then
-            if EP.Deploy and EP.TowerCount() == 0
+            -- Keep topping the squad up until every slot is filled, not just
+            -- until the first unit lands.
+            if EP.Deploy and EP.TowerCount() < EP.TotalLimit()
                 and os.clock() - (EP.LastDeploy or 0) > 6 then
                 EP.LastDeploy = os.clock()
                 pcall(EP.PlaceAll)
