@@ -135,9 +135,14 @@ local State = {
     CrateAuto = false,
     CrateCursed = true,
     CrateDiamond = false,
+    CrateGolden = false,
     CrateInterval = 5,
     CrateAmount = 3,
     CrateDiamondName = "MegaDiamond",
+    -- Every crate type the shop lists, keyed by the side button name. nil means
+    -- "not decided yet", which counts as on, so Open All works out of the box.
+    CrateKinds = {},
+    CrateEverySlot = false,
     CrateTopOnly = true,
     CrateAutoRefresh = true,
     CrateRefreshSeconds = 10,
@@ -21085,6 +21090,11 @@ do
         Opened = 0,
         LastDrop = "",
         KindIndex = 0,
+        AllRunning = false,
+        AllToken = 0,
+        AllDone = 0,
+        AllTotal = 0,
+        AllSkipped = 0,
     }
 
     local VimService = nil
@@ -21543,6 +21553,69 @@ do
         golden = "PlayerGui.Main.Frame.Layout.ShardGamba.Frame.Side.Boxes.Golden",
     }
 
+    -- The shop's own crate list. Every button in here is a crate the server
+    -- knows, and its Name is exactly the string NotGambling expects - the two
+    -- ids that already worked (Cursed, MegaDiamond) are button names too.
+    -- Reading the list beats a hardcoded table: the game keeps adding crates
+    -- (Clock / Credits / Premium variants) and this picks them up for free.
+    Crates.SidePath = "Main.Frame.Layout.ShardGamba.Frame.Side.Boxes"
+    Crates.CatalogCache = nil
+    Crates.CatalogAt = 0
+
+    function Crates.LabelOf(button)
+        for _, child in ipairs(button:GetDescendants()) do
+            if child:IsA("TextLabel") and child.Name == "TextLabel" and child.Text ~= "" then
+                return child.Text
+            end
+        end
+        return button.Name
+    end
+
+    -- Ordered exactly like the shop shows them. Cached briefly because the
+    -- stock panel rebuilds this list on every crate switch and walking it
+    -- hundreds of times per run is pointless.
+    function Crates.Catalog(force)
+        local now = os.clock()
+        if not force and Crates.CatalogCache and now - (Crates.CatalogAt or 0) < 1.5 then
+            return Crates.CatalogCache
+        end
+        local list = {}
+        local side = Crates.Resolve(Crates.SidePath)
+        if side then
+            local buttons = {}
+            for _, child in ipairs(side:GetChildren()) do
+                if child:IsA("GuiButton") then
+                    table.insert(buttons, child)
+                end
+            end
+            table.sort(buttons, function(a, b)
+                if a.LayoutOrder ~= b.LayoutOrder then
+                    return a.LayoutOrder < b.LayoutOrder
+                end
+                return a.Name < b.Name
+            end)
+            for _, button in ipairs(buttons) do
+                table.insert(list, { Id = button.Name, Label = Crates.LabelOf(button) })
+            end
+        end
+        Crates.CatalogCache = list
+        Crates.CatalogAt = now
+        return list
+    end
+
+    -- The alias table only exists for the three old lowercase ids
+    -- (diamond -> MegaDiamond). A real button name is CamelCase and must reach
+    -- the server untouched, otherwise "Diamond" would quietly open
+    -- "MegaDiamond" - a different crate at a different price.
+    function Crates.ResolveName(kind)
+        local raw = tostring(kind)
+        local alias = Crates.Names[string.lower(raw)]
+        if alias and raw == string.lower(raw) then
+            return alias
+        end
+        return raw
+    end
+
     -- Dotted path from the Explorer, with or without PlayerGui in front.
     function Crates.Resolve(path)
         local gui = PlayerGuiOf()
@@ -21609,31 +21682,31 @@ do
         return nil
     end
 
-    function Crates.Fire(kind, count)
+    function Crates.Fire(kind, slot)
         local remote = Crates.Remote()
         if not remote then
             return false, "NotGambling remote not found"
         end
-        local name = Crates.Names[string.lower(tostring(kind))] or tostring(kind)
-        local amount = math.clamp(math.floor(tonumber(count) or 1), 1, 3)
+        local name = Crates.ResolveName(kind)
+        local used = math.clamp(math.floor(tonumber(slot) or 1), 1, 3)
         local ok, err = pcall(function()
-            remote:FireServer(amount, name)
+            remote:FireServer(used, name)
         end)
         if not ok then
             return false, tostring(err)
         end
-        return true, name, amount
+        return true, name, used
     end
 
-    function Crates.Open(kind)
-        kind = string.lower(tostring(kind or "cursed"))
+    function Crates.Open(kind, slot)
+        kind = tostring(kind or "cursed")
         Crates.LastKind = kind
 
         -- make sure the instant-skip listener is live before we fire, so even
         -- a one-off manual open skips the animation
         pcall(Crates.Attach)
 
-        local fired, name, amount = Crates.Fire(kind, State.CrateAmount)
+        local fired, name, amount = Crates.Fire(kind, slot or State.CrateAmount)
         if fired then
             Crates.Opens = Crates.Opens + 1
             Crates.LastClickMethod = "remote"
@@ -21642,7 +21715,9 @@ do
         end
 
         -- Fallback only: if the remote ever gets renamed, click the GUI instead.
-        local button = Crates.Resolve(Crates.ButtonPath[kind] or "") or Crates.FindButton(kind)
+        local button = Crates.Resolve(Crates.ButtonPath[string.lower(kind)] or "")
+            or Crates.Resolve(Crates.SidePath .. "." .. tostring(kind))
+            or Crates.FindButton(kind)
         if not button then
             Report(tostring(name) .. " | no remote, no crate button on screen")
             return false, Crates.Status
@@ -21663,18 +21738,114 @@ do
         return true, Crates.Status
     end
 
+    -- Everything the shop offers, minus the types the player switched off.
+    -- An id nobody has an opinion about counts as on, so a fresh config opens
+    -- all fourteen crates instead of the old hardcoded three.
     function Crates.Kinds()
+        local chosen = State.CrateKinds or {}
+        local catalog = Crates.Catalog()
         local kinds = {}
-        if State.CrateCursed then
-            table.insert(kinds, "cursed")
+        if #catalog == 0 then
+            -- Shop closed: fall back to whatever was ticked, then the classics.
+            for id, on in pairs(chosen) do
+                if on then
+                    table.insert(kinds, id)
+                end
+            end
+            if #kinds == 0 then
+                for _, id in ipairs({ "Cursed", "MegaDiamond", "Golden" }) do
+                    table.insert(kinds, id)
+                end
+            end
+            table.sort(kinds)
+            return kinds
         end
-        if State.CrateDiamond then
-            table.insert(kinds, "diamond")
-        end
-        if State.CrateGolden then
-            table.insert(kinds, "golden")
+        for _, entry in ipairs(catalog) do
+            if chosen[entry.Id] ~= false then
+                table.insert(kinds, entry.Id)
+            end
         end
         return kinds
+    end
+
+    -- One crate of every type, optionally in all three slots (A, B, C are three
+    -- separate offers of the same crate, not three copies of one). Runs in its
+    -- own thread so the button returns at once, and every open still goes
+    -- through Crates.Open, which means the instant-skip listener keeps
+    -- answering and the chain stays fast.
+    function Crates.OpenAll(opts)
+        opts = opts or {}
+        if Crates.AllRunning then
+            return false, "already opening"
+        end
+        Crates.AllToken = (Crates.AllToken or 0) + 1
+        local token = Crates.AllToken
+        Crates.AllRunning = true
+        Crates.AllDone = 0
+        Crates.AllTotal = 0
+        Crates.AllSkipped = 0
+
+        task.spawn(function()
+            local catalog = Crates.Catalog(true)
+            if #catalog == 0 then
+                Crates.AllRunning = false
+                Report("open all - open the crate shop first")
+                return
+            end
+
+            local chosen = State.CrateKinds or {}
+            local slots
+            if opts.EverySlot or State.CrateEverySlot then
+                slots = { 1, 2, 3 }
+            else
+                slots = { math.clamp(math.floor(tonumber(State.CrateAmount) or 1), 1, 3) }
+            end
+
+            local queue = {}
+            for _, entry in ipairs(catalog) do
+                if chosen[entry.Id] ~= false then
+                    for _, slot in ipairs(slots) do
+                        table.insert(queue, { Id = entry.Id, Label = entry.Label, Slot = slot })
+                    end
+                end
+            end
+            Crates.AllTotal = #queue
+            if Crates.AllTotal == 0 then
+                Crates.AllRunning = false
+                Report("open all - every crate is switched off")
+                return
+            end
+
+            for index, item in ipairs(queue) do
+                if Crates.AllToken ~= token then
+                    break
+                end
+                local ok = Crates.Open(item.Id, item.Slot)
+                if ok then
+                    Crates.AllDone = Crates.AllDone + 1
+                else
+                    Crates.AllSkipped = Crates.AllSkipped + 1
+                end
+                Report(string.format(
+                    "all %d/%d  %s  slot %d",
+                    index, Crates.AllTotal, tostring(item.Label or item.Id), item.Slot))
+                task.wait(math.max(tonumber(Crates.Gap) or 0.05, 0.05))
+            end
+
+            Crates.AllRunning = false
+            Report(string.format(
+                "open all done: %d/%d opened, %d skipped",
+                Crates.AllDone, Crates.AllTotal, Crates.AllSkipped))
+        end)
+
+        return true, "started"
+    end
+
+    function Crates.StopAll()
+        Crates.AllToken = (Crates.AllToken or 0) + 1
+        Crates.AllRunning = false
+        Report("open all stopped")
+        return true
     end
 
     function Crates.SetAuto(enabled)
@@ -24030,6 +24201,8 @@ State.PumpkinByRoute = Config.PumpkinByRoute ~= false
 State.PumpkinRoutePasses = math.clamp(math.floor(tonumber(Config.PumpkinRoutePasses) or 2), 1, 10)
 State.CrateCursed = Config.CrateCursed ~= false
 State.CrateDiamond = Config.CrateDiamond == true
+State.CrateKinds = type(Config.CrateKinds) == "table" and Config.CrateKinds or {}
+State.CrateEverySlot = Config.CrateEverySlot == true
 State.CrateInterval = math.clamp(math.floor(tonumber(Config.CrateInterval) or 5), 1, 120)
 State.CrateAmount = math.clamp(math.floor(tonumber(Config.CrateAmount) or 3), 1, 100)
 State.CrateDiamondName = tostring(Config.CrateDiamondName or "MegaDiamond")
@@ -24140,6 +24313,8 @@ local function SaveConfig()
         PumpkinRoutePasses = State.PumpkinRoutePasses,
         CrateCursed = State.CrateCursed,
         CrateDiamond = State.CrateDiamond,
+        CrateKinds = State.CrateKinds,
+        CrateEverySlot = State.CrateEverySlot,
         CrateInterval = State.CrateInterval,
         CrateAmount = State.CrateAmount,
         CrateDiamondName = State.CrateDiamondName,
@@ -25805,31 +25980,21 @@ CrateBox:AddSlider("Chain Gap", 0, 50, math.floor((tonumber(State.CrateGap) or 0
     end
     QueueSave()
 end)
-CrateBox:AddToggle("Cursed Crate", "Include the cursed crate in the rotation", State.CrateCursed, function(value)
-    State.CrateCursed = value == true
+-- The rotation is no longer three hardcoded crates: every crate the shop
+-- lists is discovered at runtime (see Crates.Catalog) and gets its own toggle
+-- in the "Crate Types" box on the right. This switch decides whether Open All
+-- fires one slot per crate or all three.
+CrateBox:AddToggle("Every Slot (A+B+C)", "Open All fires slots 1, 2 and 3 of each crate", State.CrateEverySlot, function(value)
+    State.CrateEverySlot = value == true
     QueueSave()
 end)
-CrateBox:AddToggle("Diamond Crate", "Include the diamond crate in the rotation", State.CrateDiamond, function(value)
-    State.CrateDiamond = value == true
-    QueueSave()
+CrateBox:AddActionRow("Open All Crates", "One open of every ticked crate type in the shop", StarHubUI.Icons.Zap, function()
+    local ok, message = Hub.Crates.OpenAll()
+    Notify("Open All Crates", tostring(message))
 end)
-CrateBox:AddToggle("Golden Crate", "Include the plain Golden Shard crate (80) in the rotation", State.CrateGolden, function(value)
-    State.CrateGolden = value == true
-    QueueSave()
-end)
--- The side button is called MegaDiamond, so that is the name sent to the remote.
--- Kept editable in case the server wants a different string.
-CrateBox:AddInput("Diamond Name", "MegaDiamond", State.CrateDiamondName, function(value)
-    local name = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    if name == "" then
-        name = "MegaDiamond"
-    end
-    State.CrateDiamondName = name
-    if Hub.Crates then
-        Hub.Crates.Names.diamond = name
-        Hub.Crates.Names.megadiamond = name
-    end
-    QueueSave()
+CrateBox:AddActionRow("Stop Opening", "Cancels the running Open All", StarHubUI.Icons.Skull, function()
+    Hub.Crates.StopAll()
+    Notify("Open All Crates", "stopped")
 end)
 CrateBox:AddSlider("Open Every", 1, 120, State.CrateInterval, " s", function(value)
     State.CrateInterval = math.clamp(math.floor(tonumber(value) or 5), 1, 120)
@@ -25921,8 +26086,88 @@ local function MakeStockList(box, height)
     return wrapper
 end
 
-local StockBox = CrateTab:CreateGroupBox("Right", "Stock: Legendary - Secret", "LIVE", StarHubUI.Icons.Dashboard)
+-- Crate types ---------------------------------------------------------------
+-- One toggle per crate the shop actually lists. Nothing is hardcoded: press
+-- Scan with the crate shop open and the rows appear in shop order. An id with
+-- no opinion yet counts as ON, so Open All works before the first scan too.
+local TypesBox = CrateTab:CreateGroupBox("Right", "Crate Types", "EVERY CRATE IN THE SHOP", StarHubUI.Icons.Skull)
+Gui.CrateTypesInfo = MakeInfoRow(TypesBox, "Crate types: not scanned", "Open the crate shop, then press Scan", StarHubUI.Icons.Skull)
 
+local crateToggleSeen = {}
+local crateToggleHandles = {}
+
+local function RefreshCrateTypeRows(force)
+    if not Hub.Crates then
+        return 0
+    end
+    local catalog = Hub.Crates.Catalog(force == true)
+    local added = 0
+    for _, entry in ipairs(catalog) do
+        local id = entry.Id
+        if not crateToggleSeen[id] then
+            crateToggleSeen[id] = true
+            crateToggleHandles[id] = TypesBox:AddToggle(
+                entry.Label or id,
+                string.format('NotGambling(slot, "%s")', id),
+                State.CrateKinds[id] ~= false,
+                function(value)
+                    State.CrateKinds[id] = value == true
+                    QueueSave()
+                end
+            )
+            added = added + 1
+        end
+    end
+    if Gui.CrateTypesInfo then
+        if #catalog == 0 then
+            Gui.CrateTypesInfo:SetTitle("Crate types: shop closed")
+            Gui.CrateTypesInfo:SetDesc("Open the crate shop and press Scan")
+        else
+            Gui.CrateTypesInfo:SetTitle(string.format("Crate types: %d found", #catalog))
+            Gui.CrateTypesInfo:SetDesc(string.format("%d new row(s) added", added))
+        end
+    end
+    return #catalog
+end
+
+TypesBox:AddActionRow("Scan Crate List", "Reads every crate button from the shop and builds a toggle per type", StarHubUI.Icons.Search, function()
+    local found = RefreshCrateTypeRows(true)
+    Notify("Crate Types", found > 0 and string.format("%d crates found", found) or "shop is closed")
+end)
+TypesBox:AddActionRow("Tick Every Crate", "Switches every known crate type on", StarHubUI.Icons.Zap, function()
+    for id in pairs(crateToggleSeen) do
+        State.CrateKinds[id] = true
+        if crateToggleHandles[id] then
+            crateToggleHandles[id]:Set(true)
+        end
+    end
+    QueueSave()
+    Notify("Crate Types", "all on")
+end)
+TypesBox:AddActionRow("Untick Every Crate", "Switches every known crate type off", StarHubUI.Icons.Skull, function()
+    for id in pairs(crateToggleSeen) do
+        State.CrateKinds[id] = false
+        if crateToggleHandles[id] then
+            crateToggleHandles[id]:Set(false)
+        end
+    end
+    QueueSave()
+    Notify("Crate Types", "all off")
+end)
+
+-- The shop is usually already open when the hub loads, so try to fill the list
+-- on its own for the first half minute instead of making the player press Scan.
+task.spawn(function()
+    for _ = 1, 20 do
+        task.wait(1.5)
+        if Hub.Crates and #Hub.Crates.Catalog(true) > 0 then
+            pcall(RefreshCrateTypeRows, false)
+            return
+        end
+    end
+end)
+
+local StockBox = CrateTab:CreateGroupBox("Right", "Stock: Legendary - Secret", "LIVE", StarHubUI.Icons.Dashboard)
 -- The panel keeps showing the previous crate until its side button is pressed,
 -- so switching and rescanning is one action here.
 StockBox:AddActionRow("Show Cursed Stock", "Presses Side.Boxes.Cursed, then rescans", StarHubUI.Icons.Skull, function()
