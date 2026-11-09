@@ -28405,6 +28405,23 @@ do
             look = cam.CFrame.RightVector
         end
         cam.CFrame = CFrame.lookAt(eye, eye + look.Unit)
+        -- The client only falls back to the character's facing when the camera
+        -- is already clear, which is exactly the state we just created - so the
+        -- root part must not be pointing at him either.
+        local root = EP.Root()
+        if root then
+            local flat = Vector3.new(toWOD.X, 0, toWOD.Z)
+            if flat.Magnitude > 0.01 then
+                flat = flat.Unit
+                local facing = root.CFrame.LookVector
+                local flatFacing = Vector3.new(facing.X, 0, facing.Z)
+                if flatFacing.Magnitude > 0.01 and flatFacing.Unit:Dot(flat) > 0.3 then
+                    pcall(function()
+                        root.CFrame = CFrame.lookAt(root.Position, root.Position - flat)
+                    end)
+                end
+            end
+        end
         EP.NoLookActive = true
         return true
     end
@@ -28666,20 +28683,30 @@ do
         end
     end
 
+    -- RenderStepped would lose the race: Roblox's own camera script also runs
+    -- there and would put the view back on the Watcher. Binding one step after
+    -- RenderPriority.Camera means our correction is always the last word.
     function EP.StartRenderLoop()
         if EP.RenderConn then
             return
         end
-        EP.RenderConn = game:GetService("RunService").RenderStepped:Connect(function()
+        local run = game:GetService("RunService")
+        pcall(function()
+            run:UnbindFromRenderStep("EP79NoLook")
+        end)
+        run:BindToRenderStep("EP79NoLook", Enum.RenderPriority.Camera.Value + 5, function()
             if EP.Enabled and EP.NoLook then
                 pcall(EP.AvoidWOD)
             end
         end)
+        EP.RenderConn = true
     end
 
     function EP.StopRenderLoop()
         if EP.RenderConn then
-            pcall(function() EP.RenderConn:Disconnect() end)
+            pcall(function()
+                game:GetService("RunService"):UnbindFromRenderStep("EP79NoLook")
+            end)
             EP.RenderConn = nil
         end
         EP.NoLookActive = false
