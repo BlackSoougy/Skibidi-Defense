@@ -27900,7 +27900,8 @@ Gui.Step("post:done")
 -- the flak chase and finally the WOD boss. Everything below drives the game's
 -- own remotes, taken from the decompiled client:
 --   placeTower(unitId, CFrame, false)        Event.placeTower
---   UpgradeTower(towerFolderName)            Event.UpgradeTower
+--   UpgradeTower(towerGuid)                  Event.UpgradeTower
+--     the guid is the model name inside Scripted.Towers, not the unit id
 --   Minigame:FireServer("Complete", id)      CarrierScenario.Prep.Minigame
 --   Steer:FireServer(Vector2, boost)         CarrierScenario.Steer
 --   Fire:FireServer(gunIndex, aimPos, sky)   CarrierScenario.Fire
@@ -27916,13 +27917,21 @@ Hub.EP79 = Hub.EP79 or {}
 do
     local EP = Hub.EP79
 
+    -- Caps and max levels are read from the game itself at runtime: every unit
+    -- has its own UpgradeData table (Brute tops out at 4, Strider at 3,
+    -- MafiaMutant at 2), so hardcoding one number was wrong.
     EP.MaxLevel = 4
+    EP.PerUnit = 4
     EP.Slots = {
         { Unit = "ArmadaBrute", Limit = 3 },
         { Unit = "ArmadaSpeakerwoman", Limit = 1 },
         { Unit = "ArmadaStrider", Limit = 1 },
         { Unit = "ArmadaLarge", Limit = 2 },
     }
+    EP.MaxLevels = {}
+    EP.Units = nil
+    EP.PlaceOK = 0
+    EP.PlaceHook = nil
 
     EP.Enabled = false
     EP.Token = 0
@@ -28025,96 +28034,222 @@ do
         return folder and #folder:GetChildren() or 0
     end
 
-    -- The server drops bad spots silently, so the only trustworthy signal that
-    -- a placement landed is the tower count going up.
-    function EP.TryPlace(unit, position)
+    -- Which units this chapter actually offers comes from the game, not from a
+    -- guess: Event.getTowers returns the live list (4 Armada units plus the
+    -- three toilets/mutants the base prep unlocks).
+    function EP.UnitList()
+        if EP.Units and #EP.Units > 0 then
+            return EP.Units
+        end
+        local list = {}
+        local events = EP.RS:FindFirstChild("Event")
+        local get = events and events:FindFirstChild("getTowers")
+        if get then
+            local ok, res = pcall(function()
+                return get:InvokeServer()
+            end)
+            if ok and type(res) == "table" then
+                for _, value in ipairs(res) do
+                    if type(value) == "string" then
+                        list[#list + 1] = value
+                    end
+                end
+            end
+        end
+        if #list == 0 then
+            for _, slot in ipairs(EP.Slots) do
+                list[#list + 1] = slot.Unit
+            end
+        end
+        EP.Units = list
+        return list
+    end
+
+    -- Max level per unit, taken from the stats module's UpgradeData keys.
+    function EP.MaxLevelOf(unit)
+        local cached = EP.MaxLevels[unit]
+        if cached then
+            return cached
+        end
+        local stats = EP.RS:FindFirstChild("TowerData")
+        stats = stats and stats:FindFirstChild("Stats")
+        local module = stats and stats:FindFirstChild(unit)
+        local level = EP.MaxLevel
+        if module then
+            local ok, data = pcall(require, module)
+            if ok and type(data) == "table" and type(data.TowerStats) == "table"
+                and type(data.TowerStats.UpgradeData) == "table" then
+                local best = 0
+                for key in pairs(data.TowerStats.UpgradeData) do
+                    if type(key) == "number" and key > best then
+                        best = key
+                    end
+                end
+                if best > 0 then
+                    level = best
+                end
+            end
+        end
+        EP.MaxLevels[unit] = level
+        return level
+    end
+
+    -- The floor slab is thin and rotated, so the only trustworthy height is a
+    -- raycast straight down onto it. The game does the same with its own mouse.
+    function EP.GroundY(x, z)
+        local map = workspace:FindFirstChild("Map")
+        local placement = map and map:FindFirstChild("Placement")
+        local ground = placement and placement:FindFirstChild("Ground")
+        if not ground then
+            return nil
+        end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Include
+        params.FilterDescendantsInstances = { ground }
+        local hit = workspace:Raycast(Vector3.new(x, 500, z), Vector3.new(0, -2000, 0), params)
+        return hit and hit.Position.Y or nil
+    end
+
+    -- placeTower fires back on success with the new tower's guid, which is a far
+    -- better signal than polling the tower count.
+    function EP.AttachPlace()
+        if EP.PlaceHook then
+            return true
+        end
+        local place = EP.Remote("Place")
+        if not place then
+            return false
+        end
+        EP.PlaceHook = place.OnClientEvent:Connect(function(_, unit, _, guid)
+            EP.PlaceOK = EP.PlaceOK + 1
+            EP.LastPlaced = tostring(guid or unit)
+        end)
+        return true
+    end
+
+    function EP.TryPlace(unit, x, z)
         local place = EP.Remote("Place")
         if not (place and unit) then
             return false
         end
-        local before = EP.TowerCount()
+        local y = EP.GroundY(x, z)
+        if not y then
+            return false
+        end
+        local before = EP.PlaceOK
+        local countBefore = EP.TowerCount()
         pcall(function()
-            place:FireServer(unit, CFrame.new(position), false)
+            place:FireServer(unit, CFrame.new(Vector3.new(x, y, z)), false)
         end)
-        local deadline = os.clock() + 1.1
+        local deadline = os.clock() + 0.7
         while os.clock() < deadline do
-            task.wait(0.08)
-            if EP.TowerCount() > before then
+            task.wait(0.05)
+            if EP.PlaceOK > before then
+                return true
+            end
+            if EP.TowerCount() > countBefore then
                 return true
             end
         end
         return false
     end
 
+    -- Walks a spiral of candidate points across the pad. The server silently
+    -- drops spots that overlap blockers or exceed the unit cap, so a run of
+    -- misses means "stop trying this unit" rather than "keep hammering".
     function EP.PlaceAll()
         local bounds = EP.FloorBounds()
         if not bounds then
             return false, "no placement floor"
         end
-        local placed = 0
-        for _, slot in ipairs(EP.Slots) do
-            for _ = 1, slot.Limit do
-                local done = false
-                for ring = 0, 4 do
-                    if done then break end
-                    for dx = -ring, ring do
-                        if done then break end
-                        for dz = -ring, ring do
-                            if not done and (math.abs(dx) == ring or math.abs(dz) == ring) then
-                                local x = bounds.Center.X + dx * 18
-                                local z = bounds.Center.Z + dz * 18
-                                if math.abs(x - bounds.Center.X) <= bounds.HalfX - 14
-                                    and math.abs(z - bounds.Center.Z) <= bounds.HalfZ - 14 then
-                                    if EP.TryPlace(slot.Unit, Vector3.new(x, bounds.Y, z)) then
-                                        placed = placed + 1
-                                        done = true
-                                    end
+        EP.AttachPlace()
+        local units = EP.UnitList()
+        local placed, tries = 0, 0
+        for _, unit in ipairs(units) do
+            local got, misses = 0, 0
+            for ring = 0, 5 do
+                if misses >= 3 or got >= EP.PerUnit then
+                    break
+                end
+                for dx = -ring, ring do
+                    for dz = -ring, ring do
+                        if misses < 3 and got < EP.PerUnit
+                            and (math.abs(dx) == ring or math.abs(dz) == ring) then
+                            local x = bounds.Center.X + dx * 26
+                            local z = bounds.Center.Z + dz * 26
+                            if math.abs(x - bounds.Center.X) <= bounds.HalfX - 18
+                                and math.abs(z - bounds.Center.Z) <= bounds.HalfZ - 18 then
+                                tries = tries + 1
+                                if EP.TryPlace(unit, x, z) then
+                                    placed = placed + 1
+                                    got = got + 1
+                                    misses = 0
+                                else
+                                    misses = misses + 1
                                 end
                             end
                         end
                     end
                 end
             end
+            if got > 0 then
+                EP.SetStatus(string.format("deployed %s x%d", unit, got))
+            end
         end
-        EP.SetStatus(string.format("deployed %d units", placed))
+        EP.SetStatus(string.format("deployed %d units (%d tries)", placed, tries))
         return placed > 0, placed
     end
 
     ------------------------------------------------------------------
     -- Upgrade
     ------------------------------------------------------------------
+    -- UpgradeTower wants the guid of the model inside Scripted.Towers, not the
+    -- unit id - the first version sent the id and nothing ever levelled. The
+    -- mirror in Scripted.TowerData carries the ID attribute, which is how we
+    -- know the per-unit level cap.
     function EP.UpgradeAll()
         local upgrade = EP.Remote("Upgrade")
-        local folder = EP.TowerFolder()
+        local folder = EP.TowersModel()
         if not (upgrade and folder) then
             return false, "no upgrade remote"
         end
-        local maxed = 0
+        local mirror = EP.TowerFolder()
+        local maxed, fired = 0, 0
         for _, tower in ipairs(folder:GetChildren()) do
-            for _ = 1, 12 do
-                if tower.Parent ~= folder then break end
+            local data = mirror and mirror:FindFirstChild(tower.Name)
+            local id = (data and data:GetAttribute("ID")) or tower:GetAttribute("ID") or tower.Name
+            local cap = EP.MaxLevelOf(tostring(id))
+            for _ = 1, 8 do
+                if tower.Parent ~= folder then
+                    break
+                end
                 local level = tonumber(tower:GetAttribute("Upgrade")) or 0
-                if level >= EP.MaxLevel then
+                if level >= cap then
                     maxed = maxed + 1
                     break
                 end
                 pcall(function()
                     upgrade:FireServer(tostring(tower.Name))
                 end)
-                local deadline = os.clock() + 1.0
+                fired = fired + 1
+                local deadline = os.clock() + 0.8
                 local progressed = false
                 while os.clock() < deadline do
-                    task.wait(0.06)
-                    if tower.Parent ~= folder then break end
+                    task.wait(0.05)
+                    if tower.Parent ~= folder then
+                        break
+                    end
                     if (tonumber(tower:GetAttribute("Upgrade")) or 0) > level then
                         progressed = true
                         break
                     end
                 end
-                if not progressed then break end
+                if not progressed then
+                    break
+                end
             end
         end
-        EP.SetStatus(string.format("maxed %d towers", maxed))
+        EP.SetStatus(string.format("maxed %d/%d towers", maxed, fired > 0 and fired or maxed))
         return maxed > 0, maxed
     end
 
@@ -28372,9 +28507,23 @@ do
     -- During the flak payback and the boss the player mans the turret, and
     -- every gun is a plain FireServer(gunIndex, aimPos). Railguns are hitscan
     -- with no travel time, so they are the safe default.
+    -- The boss is worth more than any add, so it wins whenever it is on the
+    -- field; otherwise take whatever is closest to the player.
     function EP.NearestEnemy()
         local s = EP.Scripted()
-        local enemies = s and s:FindFirstChild("Enemies")
+        if not s then
+            return nil
+        end
+        for _, bossName in ipairs({ "WODBoss", "DuchessBoss" }) do
+            local boss = s:FindFirstChild(bossName)
+            if boss then
+                local ok, pivot = pcall(function() return boss:GetPivot().Position end)
+                if ok and pivot then
+                    return pivot
+                end
+            end
+        end
+        local enemies = s:FindFirstChild("Enemies")
         if not enemies then
             return nil
         end
@@ -28383,7 +28532,7 @@ do
         local best, bestDist = nil, math.huge
         for _, enemy in ipairs(enemies:GetChildren()) do
             local ok, pivot = pcall(function() return enemy:GetPivot().Position end)
-            if ok then
+            if ok and pivot then
                 local dist = (pivot - origin).Magnitude
                 if dist < bestDist then
                     best, bestDist = pivot, dist
@@ -28392,6 +28541,12 @@ do
         end
         return best
     end
+
+    -- Config.Guns gives every weapon its own cooldown (Jugg 8.5s, Railguns 2s,
+    -- Blasters 0.5s) and the server tracks them separately, so the best damage
+    -- is simply keeping all three on rotation instead of spamming one.
+    EP.GunCooldowns = { 8.5, 2, 0.5 }
+    EP.NextFire = {}
 
     function EP.AutoFire()
         local fire = EP.Remote("Fire")
@@ -28402,23 +28557,30 @@ do
         if not target then
             return false
         end
-        if os.clock() - (EP.LastFire or 0) < 0.45 then
-            return false
-        end
-        EP.LastFire = os.clock()
         if not EP.GunClaimed then
             EP.GunClaimed = true
             pcall(function()
+                -- The gunner client sets this flag itself on entry; the server
+                -- uses it to tell who is allowed to fire.
+                EP.LP:SetAttribute("CarrierGunner", true)
                 local control = EP.Remote("Control")
                 if control then
                     control:FireServer("Claim", 2)
                 end
             end)
         end
-        pcall(function()
-            fire:FireServer(2, target, true)
-        end)
-        return true
+        local now = os.clock()
+        local fired = false
+        for index, cooldown in ipairs(EP.GunCooldowns) do
+            if now >= (EP.NextFire[index] or 0) then
+                EP.NextFire[index] = now + cooldown
+                pcall(function()
+                    fire:FireServer(index, target, nil)
+                end)
+                fired = true
+            end
+        end
+        return fired
     end
 
     ------------------------------------------------------------------
