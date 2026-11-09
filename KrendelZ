@@ -21095,6 +21095,14 @@ do
         AllDone = 0,
         AllTotal = 0,
         AllSkipped = 0,
+        -- Auto chain guard. A crate the server refuses (Credits / Premium with
+        -- no balance, a locked event crate) simply never answers, and the old
+        -- chain only advanced on NotGambling.Opening - so one silent crate
+        -- froze the whole run until the toggle was flipped again.
+        Fails = {},
+        MaxFails = 2,
+        LastAnswerAt = 0,
+        Watchdog = false,
     }
 
     local VimService = nil
@@ -21268,14 +21276,14 @@ do
             if not Crates.AutoRunning then
                 return
             end
-            local kinds = Crates.Kinds()
-            if #kinds == 0 then
+            Crates.MarkAnswer()
+            local kind = Crates.NextKind()
+            if not kind then
                 Crates.AutoRunning = false
                 Report("auto stopped - no crate ticked")
                 return
             end
-            Crates.KindIndex = ((Crates.KindIndex or 0) % #kinds) + 1
-            pcall(Crates.Open, kinds[Crates.KindIndex])
+            pcall(Crates.Open, kind)
         end)
         Report("instant skip ready")
 
@@ -21848,6 +21856,80 @@ do
         return true
     end
 
+    -- Auto chain guard -------------------------------------------------------
+    -- The chain used to live only on NotGambling.Opening: open -> answer ->
+    -- next open. A crate the server refuses (Credits / Premium without the
+    -- balance, a locked event crate) never answers, so the run froze after a
+    -- few crates and the toggle had to be flipped again. Now a silent crate is
+    -- counted, skipped, and the chain moves on to the next type by itself.
+
+    function Crates.MarkAnswer()
+        Crates.LastAnswerAt = os.clock()
+        if Crates.LastKind then
+            Crates.Fails[Crates.LastKind] = nil
+        end
+    end
+
+    -- Next crate that still answers, in shop order. When every type is marked
+    -- dead the marks are cleared and the rotation starts over, so a temporary
+    -- "no balance" never kills the run for good.
+    function Crates.NextKind()
+        local kinds = Crates.Kinds()
+        if #kinds == 0 then
+            return nil
+        end
+        for _ = 1, #kinds do
+            Crates.KindIndex = ((Crates.KindIndex or 0) % #kinds) + 1
+            local kind = kinds[Crates.KindIndex]
+            if (Crates.Fails[kind] or 0) < (Crates.MaxFails or 2) then
+                return kind
+            end
+        end
+        for _, kind in ipairs(kinds) do
+            Crates.Fails[kind] = nil
+        end
+        Crates.KindIndex = ((Crates.KindIndex or 0) % #kinds) + 1
+        return kinds[Crates.KindIndex]
+    end
+
+    function Crates.StartWatchdog()
+        if Crates.Watchdog then
+            return
+        end
+        Crates.Watchdog = true
+        task.spawn(function()
+            while State.Running and Crates.Watchdog do
+                task.wait(0.35)
+                if not Crates.AutoRunning then
+                    Crates.LastAnswerAt = os.clock()
+                else
+                    -- With Instant Skip the answer lands in ~0.15 s; without it
+                    -- the shard animation runs, so the patience has to match.
+                    local patience = Crates.Skip and 3 or 10
+                    if os.clock() - (Crates.LastAnswerAt or 0) > patience then
+                        local stuck = Crates.LastKind
+                        if stuck then
+                            Crates.Fails[stuck] = (Crates.Fails[stuck] or 0) + 1
+                            Report(string.format(
+                                "auto: %s did not answer (%d/%d) - skipping it",
+                                tostring(stuck), Crates.Fails[stuck], Crates.MaxFails or 2))
+                        end
+                        Crates.LastAnswerAt = os.clock()
+                        if Crates.AutoRunning then
+                            local kind = Crates.NextKind()
+                            if kind then
+                                pcall(Crates.Open, kind)
+                            else
+                                Crates.AutoRunning = false
+                                Report("auto stopped - every crate is switched off")
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+    end
+
     function Crates.SetAuto(enabled)
         Crates.AutoRunning = enabled == true
         Crates.AutoToken = Crates.AutoToken + 1
@@ -21859,7 +21941,8 @@ do
         Report("auto on")
         -- The old build polled on a timer and never answered Opening, so the
         -- server sat waiting for the animation every single crate. Now the
-        -- chain is driven by the Opening event itself: open -> ack -> open.
+        -- chain is driven by the Opening event itself: open -> ack -> open,
+        -- with the watchdog below picking up any crate that never answers.
         Crates.Attach()
         local kinds = Crates.Kinds()
         if #kinds == 0 then
@@ -21867,9 +21950,14 @@ do
             Report("auto on - no crate ticked")
             return
         end
+        Crates.Fails = {}
         Crates.KindIndex = 0
-        Crates.KindIndex = 1
-        pcall(Crates.Open, kinds[1])
+        Crates.LastAnswerAt = os.clock()
+        Crates.StartWatchdog()
+        local kind = Crates.NextKind()
+        if kind then
+            pcall(Crates.Open, kind)
+        end
     end
 
     local function RarityOf(text)
