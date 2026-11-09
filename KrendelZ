@@ -27893,6 +27893,766 @@ pcall(SetStatus, "Idle", State.ProfileName ~= "" and ("Loaded " .. State.Profile
 Gui.Step("post:save")
 pcall(SaveConfig)
 Gui.Step("post:done")
+-- ============================================================================
+-- Episode 79 auto-pilot
+-- ============================================================================
+-- The carrier chapter runs four phases back to back: tower waves, base prep,
+-- the flak chase and finally the WOD boss. Everything below drives the game's
+-- own remotes, taken from the decompiled client:
+--   placeTower(unitId, CFrame, false)        Event.placeTower
+--   UpgradeTower(towerFolderName)            Event.UpgradeTower
+--   Minigame:FireServer("Complete", id)      CarrierScenario.Prep.Minigame
+--   Steer:FireServer(Vector2, boost)         CarrierScenario.Steer
+--   Fire:FireServer(gunIndex, aimPos, sky)   CarrierScenario.Fire
+--   Control:FireServer("Claim", gunIndex)    CarrierScenario.Control
+--
+-- The station minigames are the big shortcut. The server only checks that
+-- MinGameSeconds (1.2 s) has elapsed, so firing "Complete" is enough - no
+-- dragging wires, no timing game, no valve.
+--
+-- Kept deliberately thin on locals: the chunk is already at 187 of Lua's 200
+-- register limit, so every helper lives on the EP table instead.
+Hub.EP79 = Hub.EP79 or {}
+do
+    local EP = Hub.EP79
+
+    EP.MaxLevel = 4
+    EP.Slots = {
+        { Unit = "ArmadaBrute", Limit = 3 },
+        { Unit = "ArmadaSpeakerwoman", Limit = 1 },
+        { Unit = "ArmadaStrider", Limit = 1 },
+        { Unit = "ArmadaLarge", Limit = 2 },
+    }
+
+    EP.Enabled = false
+    EP.Token = 0
+    EP.Status = "idle"
+    EP.MiniDone = 0
+    EP.MiniHook = nil
+    EP.LastSteer = Vector2.zero
+    EP.NoLookActive = false
+    EP.RenderConn = nil
+    EP.GunClaimed = false
+
+    EP.RS = game:GetService("ReplicatedStorage")
+    EP.LP = game:GetService("Players").LocalPlayer
+
+    function EP.SetStatus(text)
+        EP.Status = tostring(text)
+        if EP.OnStatus then
+            pcall(EP.OnStatus, EP.Status)
+        end
+    end
+
+    function EP.Scripted()
+        return workspace:FindFirstChild("Scripted")
+    end
+
+    function EP.TowerFolder()
+        local s = EP.Scripted()
+        return s and s:FindFirstChild("TowerData")
+    end
+
+    function EP.TowersModel()
+        local s = EP.Scripted()
+        return s and s:FindFirstChild("Towers")
+    end
+
+    function EP.Carrier()
+        return EP.RS:FindFirstChild("CarrierScenario")
+    end
+
+    function EP.Remote(name)
+        local carrier = EP.Carrier()
+        if name == "Place" or name == "Upgrade" then
+            local events = EP.RS:FindFirstChild("Event")
+            if not events then return nil end
+            return events:FindFirstChild(name == "Place" and "placeTower" or "UpgradeTower")
+        end
+        local prep = carrier and carrier:FindFirstChild("Prep")
+        if name == "Minigame" or name == "Boss" then
+            return prep and prep:FindFirstChild(name)
+        end
+        return carrier and carrier:FindFirstChild(name)
+    end
+
+    function EP.Root()
+        local char = EP.LP.Character
+        return char and char:FindFirstChild("HumanoidRootPart")
+    end
+
+    function EP.Humanoid()
+        local char = EP.LP.Character
+        return char and char:FindFirstChildOfClass("Humanoid")
+    end
+
+    function EP.Clock()
+        local gameFolder = EP.RS:FindFirstChild("Game")
+        local clock = gameFolder and gameFolder:FindFirstChild("Clock")
+        return clock and clock.Value or os.clock()
+    end
+
+    ------------------------------------------------------------------
+    -- Deploy
+    ------------------------------------------------------------------
+    -- The pad is a thin slab rotated 90 degrees on Z, so Size.X is thickness
+    -- and Size.Y is the real width. Deriving the world box from the axes is
+    -- safer than hardcoding which component got swapped.
+    function EP.FloorBounds()
+        local map = workspace:FindFirstChild("Map")
+        local placement = map and map:FindFirstChild("Placement")
+        local ground = placement and placement:FindFirstChild("Ground")
+        local floor = ground and ground:FindFirstChild("Floor")
+        if not floor or not floor:IsA("BasePart") then
+            return nil
+        end
+        local cf = floor.CFrame
+        local size = floor.Size
+        return {
+            Center = cf.Position,
+            HalfX = math.abs(cf.RightVector.X) * size.X * 0.5
+                + math.abs(cf.UpVector.X) * size.Y * 0.5
+                + math.abs(cf.LookVector.X) * size.Z * 0.5,
+            HalfZ = math.abs(cf.RightVector.Z) * size.X * 0.5
+                + math.abs(cf.UpVector.Z) * size.Y * 0.5
+                + math.abs(cf.LookVector.Z) * size.Z * 0.5,
+            Y = cf.Position.Y,
+        }
+    end
+
+    function EP.TowerCount()
+        local folder = EP.TowerFolder()
+        return folder and #folder:GetChildren() or 0
+    end
+
+    -- The server drops bad spots silently, so the only trustworthy signal that
+    -- a placement landed is the tower count going up.
+    function EP.TryPlace(unit, position)
+        local place = EP.Remote("Place")
+        if not (place and unit) then
+            return false
+        end
+        local before = EP.TowerCount()
+        pcall(function()
+            place:FireServer(unit, CFrame.new(position), false)
+        end)
+        local deadline = os.clock() + 1.1
+        while os.clock() < deadline do
+            task.wait(0.08)
+            if EP.TowerCount() > before then
+                return true
+            end
+        end
+        return false
+    end
+
+    function EP.PlaceAll()
+        local bounds = EP.FloorBounds()
+        if not bounds then
+            return false, "no placement floor"
+        end
+        local placed = 0
+        for _, slot in ipairs(EP.Slots) do
+            for _ = 1, slot.Limit do
+                local done = false
+                for ring = 0, 4 do
+                    if done then break end
+                    for dx = -ring, ring do
+                        if done then break end
+                        for dz = -ring, ring do
+                            if not done and (math.abs(dx) == ring or math.abs(dz) == ring) then
+                                local x = bounds.Center.X + dx * 18
+                                local z = bounds.Center.Z + dz * 18
+                                if math.abs(x - bounds.Center.X) <= bounds.HalfX - 14
+                                    and math.abs(z - bounds.Center.Z) <= bounds.HalfZ - 14 then
+                                    if EP.TryPlace(slot.Unit, Vector3.new(x, bounds.Y, z)) then
+                                        placed = placed + 1
+                                        done = true
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        EP.SetStatus(string.format("deployed %d units", placed))
+        return placed > 0, placed
+    end
+
+    ------------------------------------------------------------------
+    -- Upgrade
+    ------------------------------------------------------------------
+    function EP.UpgradeAll()
+        local upgrade = EP.Remote("Upgrade")
+        local folder = EP.TowerFolder()
+        if not (upgrade and folder) then
+            return false, "no upgrade remote"
+        end
+        local maxed = 0
+        for _, tower in ipairs(folder:GetChildren()) do
+            for _ = 1, 12 do
+                if tower.Parent ~= folder then break end
+                local level = tonumber(tower:GetAttribute("Upgrade")) or 0
+                if level >= EP.MaxLevel then
+                    maxed = maxed + 1
+                    break
+                end
+                pcall(function()
+                    upgrade:FireServer(tostring(tower.Name))
+                end)
+                local deadline = os.clock() + 1.0
+                local progressed = false
+                while os.clock() < deadline do
+                    task.wait(0.06)
+                    if tower.Parent ~= folder then break end
+                    if (tonumber(tower:GetAttribute("Upgrade")) or 0) > level then
+                        progressed = true
+                        break
+                    end
+                end
+                if not progressed then break end
+            end
+        end
+        EP.SetStatus(string.format("maxed %d towers", maxed))
+        return maxed > 0, maxed
+    end
+
+    ------------------------------------------------------------------
+    -- Minigames
+    ------------------------------------------------------------------
+    function EP.AttachMinigame()
+        if EP.MiniHook then
+            return true
+        end
+        local minigame = EP.Remote("Minigame")
+        if not minigame then
+            return false
+        end
+        EP.MiniHook = minigame.OnClientEvent:Connect(function(kind, payload)
+            if not EP.Mini or not EP.Enabled then
+                return
+            end
+            if kind ~= "Open" or type(payload) ~= "table" or not payload.Id then
+                return
+            end
+            local id = payload.Id
+            local label = tostring(payload.Game or "?")
+            task.delay(1.35, function()
+                if not EP.Mini then
+                    return
+                end
+                pcall(function()
+                    minigame:FireServer("Complete", id)
+                end)
+                EP.MiniDone = EP.MiniDone + 1
+                EP.SetStatus(string.format("minigame %s done #%d", label, EP.MiniDone))
+            end)
+        end)
+        return true
+    end
+
+    function EP.DetachMinigame()
+        if EP.MiniHook then
+            pcall(function() EP.MiniHook:Disconnect() end)
+            EP.MiniHook = nil
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- Stations
+    ------------------------------------------------------------------
+    function EP.Stations()
+        local s = EP.Scripted()
+        local blockers = s and s:FindFirstChild("MapBlockers")
+        return blockers and blockers:FindFirstChild("BaseStations")
+    end
+
+    function EP.RepairStations()
+        local root = EP.Stations()
+        if not root then
+            return 0
+        end
+        local fired = 0
+        for _, station in ipairs(root:GetChildren()) do
+            local box = station:FindFirstChild("Box")
+            local prompt = box and box:FindFirstChild("ProximityPrompt")
+            if prompt and prompt.Enabled and station:GetAttribute("Done") ~= true then
+                pcall(function()
+                    fireproximityprompt(prompt)
+                end)
+                fired = fired + 1
+            end
+        end
+        if fired > 0 then
+            EP.SetStatus(string.format("repairing %d station(s)", fired))
+        end
+        return fired
+    end
+
+    ------------------------------------------------------------------
+    -- Duchess laser
+    ------------------------------------------------------------------
+    -- She fires straight down through her own X/Z, so the dodge is purely
+    -- horizontal: step away from her column while the beam is live.
+    function EP.DodgeDuchess()
+        local s = EP.Scripted()
+        local boss = s and s:FindFirstChild("DuchessBoss")
+        if not boss then
+            return false
+        end
+        if boss:GetAttribute("Phase") ~= "Pass" then
+            return false
+        end
+        local now = EP.Clock()
+        local passClock = boss:GetAttribute("PassClock") or now
+        local passTime = boss:GetAttribute("PassTime") or 5
+        local fireAt = boss:GetAttribute("FireAt") or 0
+        if now < passClock + fireAt or now > passClock + passTime then
+            return false
+        end
+        local root = EP.Root()
+        if not root then
+            return false
+        end
+        local ok, pivot = pcall(function() return boss:GetPivot().Position end)
+        if not ok then
+            return false
+        end
+        local away = Vector3.new(root.Position.X - pivot.X, 0, root.Position.Z - pivot.Z)
+        if away.Magnitude < 1 then
+            away = Vector3.new(1, 0, 0)
+        end
+        local target = root.Position + away.Unit * 70
+        local hum = EP.Humanoid()
+        if hum then
+            pcall(function() hum:MoveTo(target) end)
+        end
+        return true
+    end
+
+    ------------------------------------------------------------------
+    -- Watcher of Doom
+    ------------------------------------------------------------------
+    -- The client decides you are "looking" once
+    -- camera.LookVector:Dot(dirToWOD) > FaceDot (0.35) and that same branch is
+    -- what deals the damage. Keeping the dot under the threshold means the
+    -- gaze never registers at all. Runs on RenderStepped because the game
+    -- rewrites the camera every frame - a slower loop would lose the fight.
+    function EP.AvoidWOD()
+        local s = EP.Scripted()
+        local wod = s and s:FindFirstChild("WODBoss")
+        if not wod then
+            EP.NoLookActive = false
+            return false
+        end
+        local cam = workspace.CurrentCamera
+        if not cam then
+            return false
+        end
+        local ok, pivot = pcall(function() return wod:GetPivot().Position end)
+        if not ok then
+            return false
+        end
+        local eye = cam.CFrame.Position
+        local toWOD = pivot - eye
+        if toWOD.Magnitude < 1 then
+            return false
+        end
+        toWOD = toWOD.Unit
+        local dot = cam.CFrame.LookVector:Dot(toWOD)
+        if dot <= 0.22 then
+            EP.NoLookActive = false
+            return false
+        end
+        local look = cam.CFrame.LookVector - toWOD * (dot * 1.7)
+        if look.Magnitude < 0.01 then
+            look = cam.CFrame.RightVector
+        end
+        cam.CFrame = CFrame.lookAt(eye, eye + look.Unit)
+        EP.NoLookActive = true
+        return true
+    end
+
+    ------------------------------------------------------------------
+    -- Flak chase
+    ------------------------------------------------------------------
+    function EP.FlakMarks()
+        local s = EP.Scripted()
+        if not s then
+            return {}
+        end
+        local list = {}
+        for _, child in ipairs(s:GetChildren()) do
+            if child.Name == "FlakMark" and child:IsA("BasePart") then
+                list[#list + 1] = child
+            end
+        end
+        return list
+    end
+
+    function EP.CarrierModel()
+        local t = EP.TowersModel()
+        if not t then
+            return nil
+        end
+        for _, child in ipairs(t:GetChildren()) do
+            if child:GetAttribute("ID") == "ArmadaCarrier" then
+                return child
+            end
+        end
+        return t:GetChildren()[1]
+    end
+
+    function EP.SteerFlak()
+        local steer = EP.Remote("Steer")
+        if not steer then
+            return false
+        end
+        local carrier = EP.CarrierModel()
+        if not carrier then
+            return false
+        end
+        local ok, pivot = pcall(function() return carrier:GetPivot() end)
+        if not ok then
+            return false
+        end
+        local pos = pivot.Position
+        local right = pivot.RightVector
+        local flatRight = Vector3.new(right.X, 0, right.Z)
+        local steerX, steerY = 0, 0
+        for _, mark in ipairs(EP.FlakMarks()) do
+            local delta = pos - mark.Position
+            local flat = Vector3.new(delta.X, 0, delta.Z)
+            local dist = flat.Magnitude
+            if dist > 1 and dist < 280 then
+                local weight = (280 - dist) / 280
+                steerX = steerX + flat.Unit:Dot(flatRight) * weight * 2.5
+                steerY = steerY + (delta.Y > 0 and 1 or -1) * weight
+            end
+        end
+        local vector = Vector2.new(math.clamp(steerX, -1, 1), math.clamp(steerY, -1, 1))
+        if (vector - EP.LastSteer).Magnitude > 0.02 then
+            EP.LastSteer = vector
+            pcall(function()
+                steer:FireServer(vector, false)
+            end)
+        end
+        return true
+    end
+
+    ------------------------------------------------------------------
+    -- Guns
+    ------------------------------------------------------------------
+    function EP.ClaimGun(index)
+        local control = EP.Remote("Control")
+        if not control then
+            return false
+        end
+        pcall(function()
+            control:FireServer("Claim", index)
+        end)
+        return true
+    end
+
+    function EP.FireAt(target, gunIndex, sky)
+        local fire = EP.Remote("Fire")
+        if not (fire and target) then
+            return false
+        end
+        pcall(function()
+            fire:FireServer(gunIndex or 2, target, sky and true or nil)
+        end)
+        return true
+    end
+
+    ------------------------------------------------------------------
+    -- Auto fire
+    ------------------------------------------------------------------
+    -- During the flak payback and the boss the player mans the turret, and
+    -- every gun is a plain FireServer(gunIndex, aimPos). Railguns are hitscan
+    -- with no travel time, so they are the safe default.
+    function EP.NearestEnemy()
+        local s = EP.Scripted()
+        local enemies = s and s:FindFirstChild("Enemies")
+        if not enemies then
+            return nil
+        end
+        local root = EP.Root()
+        local origin = root and root.Position or Vector3.zero
+        local best, bestDist = nil, math.huge
+        for _, enemy in ipairs(enemies:GetChildren()) do
+            local ok, pivot = pcall(function() return enemy:GetPivot().Position end)
+            if ok then
+                local dist = (pivot - origin).Magnitude
+                if dist < bestDist then
+                    best, bestDist = pivot, dist
+                end
+            end
+        end
+        return best
+    end
+
+    function EP.AutoFire()
+        local fire = EP.Remote("Fire")
+        if not fire then
+            return false
+        end
+        local target = EP.NearestEnemy()
+        if not target then
+            return false
+        end
+        if os.clock() - (EP.LastFire or 0) < 0.45 then
+            return false
+        end
+        EP.LastFire = os.clock()
+        if not EP.GunClaimed then
+            EP.GunClaimed = true
+            pcall(function()
+                local control = EP.Remote("Control")
+                if control then
+                    control:FireServer("Claim", 2)
+                end
+            end)
+        end
+        pcall(function()
+            fire:FireServer(2, target, true)
+        end)
+        return true
+    end
+
+    ------------------------------------------------------------------
+    -- Boss footwork
+    ------------------------------------------------------------------
+    -- Slam and Blast both target the player's position, so standing still is
+    -- what kills you. Strafing around the base keeps the aim point moving.
+    function EP.Strafe()
+        local root = EP.Root()
+        local hum = EP.Humanoid()
+        if not (root and hum) then
+            return false
+        end
+        local angle = os.clock() * 1.1
+        local target = root.Position + Vector3.new(math.cos(angle) * 45, 0, math.sin(angle) * 45)
+        pcall(function() hum:MoveTo(target) end)
+        return true
+    end
+
+    ------------------------------------------------------------------
+    -- Phase
+    ------------------------------------------------------------------
+    function EP.Phase()
+        local s = EP.Scripted()
+        if s and (s:FindFirstChild("WODBoss") or s:FindFirstChild("DuchessBoss")) then
+            return "Boss"
+        end
+        if #EP.FlakMarks() > 0 then
+            return "Flak"
+        end
+        local gui = EP.LP:FindFirstChild("PlayerGui")
+        local basePrep = gui and gui:FindFirstChild("BasePrep")
+        if basePrep and basePrep.Enabled then
+            return "Prep"
+        end
+        if EP.TowerCount() > 0 then
+            return "Waves"
+        end
+        return "Idle"
+    end
+
+    ------------------------------------------------------------------
+    -- Loops
+    ------------------------------------------------------------------
+    -- Three different rates on purpose: dodging and the WOD camera need to
+    -- keep up with the frame, placement and upgrades are slow and chatty.
+    function EP.FastLoop()
+        if not EP.Enabled then
+            return
+        end
+        local phase = EP.Phase()
+        EP.PhaseName = phase
+        if phase == "Boss" then
+            if EP.Repair then pcall(EP.RepairStations) end
+            if EP.Dodge then pcall(EP.DodgeDuchess) end
+            if EP.Move then pcall(EP.Strafe) end
+            if EP.Gun then pcall(EP.AutoFire) end
+        elseif phase == "Flak" then
+            if EP.Steer then pcall(EP.SteerFlak) end
+            if EP.Gun then pcall(EP.AutoFire) end
+        end
+    end
+
+    function EP.SlowLoop()
+        if not EP.Enabled then
+            return
+        end
+        local phase = EP.Phase()
+        EP.PhaseName = phase
+        if phase == "Waves" or phase == "Prep" or phase == "Boss" then
+            if EP.Deploy and EP.TowerCount() == 0
+                and os.clock() - (EP.LastDeploy or 0) > 6 then
+                EP.LastDeploy = os.clock()
+                pcall(EP.PlaceAll)
+            end
+            if EP.Upgrade and os.clock() - (EP.LastUpgrade or 0) > 5 then
+                EP.LastUpgrade = os.clock()
+                pcall(EP.UpgradeAll)
+            end
+            if EP.Repair and phase ~= "Boss" then
+                pcall(EP.RepairStations)
+            end
+        end
+    end
+
+    function EP.StartRenderLoop()
+        if EP.RenderConn then
+            return
+        end
+        EP.RenderConn = game:GetService("RunService").RenderStepped:Connect(function()
+            if EP.Enabled and EP.NoLook then
+                pcall(EP.AvoidWOD)
+            end
+        end)
+    end
+
+    function EP.StopRenderLoop()
+        if EP.RenderConn then
+            pcall(function() EP.RenderConn:Disconnect() end)
+            EP.RenderConn = nil
+        end
+        EP.NoLookActive = false
+    end
+
+    function EP.Start()
+        EP.Enabled = true
+        EP.Token = EP.Token + 1
+        local token = EP.Token
+        pcall(EP.AttachMinigame)
+        EP.StartRenderLoop()
+        EP.SetStatus("running")
+        task.spawn(function()
+            while EP.Enabled and EP.Token == token do
+                pcall(EP.FastLoop)
+                task.wait(0.08)
+            end
+        end)
+        task.spawn(function()
+            while EP.Enabled and EP.Token == token do
+                pcall(EP.SlowLoop)
+                task.wait(1.2)
+            end
+        end)
+    end
+
+    function EP.Stop()
+        EP.Enabled = false
+        EP.Token = EP.Token + 1
+        EP.StopRenderLoop()
+        EP.SetStatus("stopped")
+    end
+
+    function EP.SetEnabled(value)
+        if value then
+            EP.Start()
+        else
+            EP.Stop()
+        end
+    end
+end
+
+-- Episode 79 tab -------------------------------------------------------------
+-- Thin on locals on purpose: the chunk sits at 187 of Lua's 200 registers, so
+-- the tab and its boxes hang off Hub.EP79.Gui instead of fresh names.
+do
+    local EP = Hub.EP79
+    local tab = Window:CreateTab({
+        Title = "EP79",
+        IconId = StarHubUI.Icons.Combat,
+        LayoutOrder = 9,
+    })
+
+    EP.Gui = {}
+    local left = tab:CreateGroupBox("Left", "Auto Pilot", "CARRIER", StarHubUI.Icons.Zap)
+    local right = tab:CreateGroupBox("Right", "Modules", "TOGGLES", StarHubUI.Icons.Check)
+
+    EP.Gui.Status = MakeInfoRow(left, "EP79: idle", "not running", StarHubUI.Icons.Dashboard)
+
+    left:AddToggle("Auto Complete EP79", "Runs every phase of the carrier chapter", EP.Enabled, function(value)
+        EP.SetEnabled(value == true)
+    end)
+    left:AddActionRow("Deploy + Max Now", "Places the whole squad and upgrades it", StarHubUI.Icons.Combat, function()
+        task.spawn(function()
+            local ok1 = EP.PlaceAll()
+            local ok2 = EP.UpgradeAll()
+            Notify("EP79", string.format("deploy=%s max=%s", tostring(ok1), tostring(ok2)))
+        end)
+    end)
+    left:AddActionRow("Complete Minigame Now", "Fires Complete on whatever station is open", StarHubUI.Icons.Zap, function()
+        local minigame = EP.Remote("Minigame")
+        Notify("EP79", minigame and "hooked, waiting for a station" or "no minigame remote")
+    end)
+    left:AddActionRow("Repair Stations", "Presses every live repair prompt", StarHubUI.Icons.Refresh, function()
+        local fired = EP.RepairStations()
+        Notify("EP79", string.format("%d station(s)", fired))
+    end)
+    left:AddActionRow("Stop", "Halts the auto pilot", StarHubUI.Icons.Skull, function()
+        EP.Stop()
+    end)
+
+    right:AddToggle("Auto Deploy", "Places every slot unit up to its cap", EP.Deploy, function(value)
+        EP.Deploy = value == true
+    end)
+    right:AddToggle("Auto Max Upgrade", "Pushes each tower to level 4", EP.Upgrade, function(value)
+        EP.Upgrade = value == true
+    end)
+    right:AddToggle("Auto Minigames", "Completes stations the moment they open", EP.Mini, function(value)
+        EP.Mini = value == true
+        if EP.Mini then pcall(EP.AttachMinigame) end
+    end)
+    right:AddToggle("Auto Repair", "Presses repair prompts during the boss", EP.Repair, function(value)
+        EP.Repair = value == true
+    end)
+    right:AddToggle("Dodge Duchess", "Steps out of the laser column", EP.Dodge, function(value)
+        EP.Dodge = value == true
+    end)
+    right:AddToggle("Never Look At WOD", "Keeps the camera outside the gaze cone", EP.NoLook, function(value)
+        EP.NoLook = value == true
+    end)
+    right:AddToggle("Steer Through Flak", "Slides the carrier away from bursts", EP.Steer, function(value)
+        EP.Steer = value == true
+    end)
+    right:AddToggle("Auto Fire Turret", "Keeps the railgun on the nearest target", EP.Gun, function(value)
+        EP.Gun = value == true
+    end)
+    right:AddToggle("Keep Moving", "Strafes so boss slams do not land", EP.Move, function(value)
+        EP.Move = value == true
+    end)
+
+    EP.OnStatus = function(text)
+        if EP.Gui.Status then
+            EP.Gui.Status:SetTitle("EP79: " .. tostring(text))
+            EP.Gui.Status:SetDesc(string.format("phase %s | minigames %d",
+                tostring(EP.PhaseName or "-"), EP.MiniDone or 0))
+        end
+    end
+
+    -- Keep the row honest even while idle, so the phase is visible before the
+    -- auto pilot is switched on.
+    task.spawn(function()
+        while true do
+            task.wait(1)
+            pcall(function()
+                if EP.Gui.Status then
+                    EP.Gui.Status:SetDesc(string.format("phase %s | %s | minigames %d",
+                        tostring(EP.PhaseName or EP.Phase() or "-"),
+                        EP.Enabled and "running" or "idle",
+                        EP.MiniDone or 0))
+                end
+            end)
+        end
+    end)
+end
+
 print("Skibidi Defense Hub loaded. Made By KrendelZ :3 | Toggle key: " .. tostring(Window.Keybind and Window.Keybind.Name or "RightShift"))
 
 -- Диагностика интерфейса: если меню не видно, эта строка скажет почему.
