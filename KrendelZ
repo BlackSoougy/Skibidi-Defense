@@ -21103,6 +21103,8 @@ do
         MaxFails = 2,
         LastAnswerAt = 0,
         Watchdog = false,
+        SilentStrikes = 0,
+        MaxSilent = 6,
     }
 
     local VimService = nil
@@ -21865,6 +21867,7 @@ do
 
     function Crates.MarkAnswer()
         Crates.LastAnswerAt = os.clock()
+        Crates.SilentStrikes = 0
         if Crates.LastKind then
             Crates.Fails[Crates.LastKind] = nil
         end
@@ -21915,6 +21918,15 @@ do
                                 tostring(stuck), Crates.Fails[stuck], Crates.MaxFails or 2))
                         end
                         Crates.LastAnswerAt = os.clock()
+                        Crates.SilentStrikes = (Crates.SilentStrikes or 0) + 1
+                        if Crates.SilentStrikes >= (Crates.MaxSilent or 6) then
+                            -- Nothing answered for six tries in a row: the
+                            -- server is refusing everything (no balance), so
+                            -- hammering it further would only burn the rest.
+                            Crates.AutoRunning = false
+                            Report("auto stopped - the server stopped answering, out of balance?")
+                            return
+                        end
                         if Crates.AutoRunning then
                             local kind = Crates.NextKind()
                             if kind then
@@ -21951,6 +21963,7 @@ do
             return
         end
         Crates.Fails = {}
+        Crates.SilentStrikes = 0
         Crates.KindIndex = 0
         Crates.LastAnswerAt = os.clock()
         Crates.StartWatchdog()
