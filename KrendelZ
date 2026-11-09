@@ -26090,13 +26090,14 @@ end
 -- One toggle per crate the shop actually lists. Nothing is hardcoded: press
 -- Scan with the crate shop open and the rows appear in shop order. An id with
 -- no opinion yet counts as ON, so Open All works before the first scan too.
-local TypesBox = CrateTab:CreateGroupBox("Right", "Crate Types", "EVERY CRATE IN THE SHOP", StarHubUI.Icons.Skull)
-Gui.CrateTypesInfo = MakeInfoRow(TypesBox, "Crate types: not scanned", "Open the crate shop, then press Scan", StarHubUI.Icons.Skull)
+-- Kept on Gui instead of fresh top-level locals: the chunk is already at the
+-- 200-register ceiling and one more local fails the whole compile.
+Gui.CrateTypesBox = CrateTab:CreateGroupBox("Right", "Crate Types", "EVERY CRATE IN THE SHOP", StarHubUI.Icons.Skull)
+Gui.CrateTypesInfo = MakeInfoRow(Gui.CrateTypesBox, "Crate types: not scanned", "Open the crate shop, then press Scan", StarHubUI.Icons.Skull)
+Gui.CrateTypesSeen = {}
+Gui.CrateTypesHandles = {}
 
-local crateToggleSeen = {}
-local crateToggleHandles = {}
-
-local function RefreshCrateTypeRows(force)
+function Gui.RefreshCrateTypes(force)
     if not Hub.Crates then
         return 0
     end
@@ -26104,9 +26105,9 @@ local function RefreshCrateTypeRows(force)
     local added = 0
     for _, entry in ipairs(catalog) do
         local id = entry.Id
-        if not crateToggleSeen[id] then
-            crateToggleSeen[id] = true
-            crateToggleHandles[id] = TypesBox:AddToggle(
+        if not Gui.CrateTypesSeen[id] then
+            Gui.CrateTypesSeen[id] = true
+            Gui.CrateTypesHandles[id] = Gui.CrateTypesBox:AddToggle(
                 entry.Label or id,
                 string.format('NotGambling(slot, "%s")', id),
                 State.CrateKinds[id] ~= false,
@@ -26130,25 +26131,25 @@ local function RefreshCrateTypeRows(force)
     return #catalog
 end
 
-TypesBox:AddActionRow("Scan Crate List", "Reads every crate button from the shop and builds a toggle per type", StarHubUI.Icons.Search, function()
-    local found = RefreshCrateTypeRows(true)
+Gui.CrateTypesBox:AddActionRow("Scan Crate List", "Reads every crate button from the shop and builds a toggle per type", StarHubUI.Icons.Search, function()
+    local found = Gui.RefreshCrateTypes(true)
     Notify("Crate Types", found > 0 and string.format("%d crates found", found) or "shop is closed")
 end)
-TypesBox:AddActionRow("Tick Every Crate", "Switches every known crate type on", StarHubUI.Icons.Zap, function()
-    for id in pairs(crateToggleSeen) do
+Gui.CrateTypesBox:AddActionRow("Tick Every Crate", "Switches every known crate type on", StarHubUI.Icons.Zap, function()
+    for id in pairs(Gui.CrateTypesSeen) do
         State.CrateKinds[id] = true
-        if crateToggleHandles[id] then
-            crateToggleHandles[id]:Set(true)
+        if Gui.CrateTypesHandles[id] then
+            Gui.CrateTypesHandles[id]:Set(true)
         end
     end
     QueueSave()
     Notify("Crate Types", "all on")
 end)
-TypesBox:AddActionRow("Untick Every Crate", "Switches every known crate type off", StarHubUI.Icons.Skull, function()
-    for id in pairs(crateToggleSeen) do
+Gui.CrateTypesBox:AddActionRow("Untick Every Crate", "Switches every known crate type off", StarHubUI.Icons.Skull, function()
+    for id in pairs(Gui.CrateTypesSeen) do
         State.CrateKinds[id] = false
-        if crateToggleHandles[id] then
-            crateToggleHandles[id]:Set(false)
+        if Gui.CrateTypesHandles[id] then
+            Gui.CrateTypesHandles[id]:Set(false)
         end
     end
     QueueSave()
@@ -26161,7 +26162,7 @@ task.spawn(function()
     for _ = 1, 20 do
         task.wait(1.5)
         if Hub.Crates and #Hub.Crates.Catalog(true) > 0 then
-            pcall(RefreshCrateTypeRows, false)
+            pcall(Gui.RefreshCrateTypes, false)
             return
         end
     end
