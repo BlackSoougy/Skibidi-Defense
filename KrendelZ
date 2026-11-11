@@ -2667,6 +2667,9 @@ local function StartPlayback()
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
     State.PlaceRejects = {}
     State.SkippedActions = 0
+    State.AbilityOk = 0
+    State.AbilityMiss = 0
+    State.AbilityMissLog = {}
     State.PauseFromPlayback = false
 
     -- A previous run that ended on a pause action leaves Speed at 0. Every
@@ -2725,6 +2728,18 @@ local function StartPlayback()
                 -- what the player pressed, not a "keep everything on cooldown"
                 -- instruction, so the hub must never substitute its own loop.
                 success, message = PlayAbility(action)
+                if success then
+                    State.AbilityOk = (State.AbilityOk or 0) + 1
+                else
+                    State.AbilityMiss = (State.AbilityMiss or 0) + 1
+                    local missLog = State.AbilityMissLog
+                    if missLog and #missLog < 40 then
+                        missLog[#missLog + 1] = string.format(
+                            "%d  %s  %s  slot %s  -> %s",
+                            index, tostring(action.Handle), tostring(action.Marker),
+                            tostring(action.AbilityIndex), tostring(message))
+                    end
+                end
             elseif action.Type == "Speed" then
                 success, message = PlaySpeed(action)
             elseif action.Type == "BoostLink" then
@@ -2766,6 +2781,21 @@ local function StartPlayback()
 
         if State.Playing then
             State.Playing = false
+            -- Ability replay is the part that is hard to eyeball, so the run
+            -- leaves a plain count plus the first misses on disk.
+            if HasFilesystem and type(writefile) == "function" then
+                local lines = {
+                    string.format("profile %s", tostring(State.ProfileName)),
+                    string.format("abilities cast %d, missed %d, skipped %d",
+                        tonumber(State.AbilityOk) or 0,
+                        tonumber(State.AbilityMiss) or 0,
+                        tonumber(State.SkippedActions) or 0),
+                }
+                for _, line in ipairs(State.AbilityMissLog or {}) do
+                    lines[#lines + 1] = line
+                end
+                pcall(writefile, MacroFolder .. "/AbilityLog.txt", table.concat(lines, "\n"))
+            end
             -- endlles finishes on a recorded pause (action 554, wave 135).
             -- Leaving Speed at 0 freezes the match, the wave never ends, and
             -- auto replay never fires - the farm just sits there. Release it.
