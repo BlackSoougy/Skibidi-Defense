@@ -54,6 +54,8 @@ local State = {
     MatchesCompleted = 0,
     LastCountedJobId = "",
     PendingLobbyReturn = false,
+    ReplayArmedJob = "",
+    ReplayAttempts = 0,
     JoinRequested = false,
     WebhookEnabled = false,
     WebhookURL = "",
@@ -915,6 +917,157 @@ local function SetStatus(title, detail)
     if Gui.Status then
         Gui.Status:SetTitle("State: " .. tostring(title))
         Gui.Status:SetDesc(detail or "")
+    end
+end
+
+-- Auto Replay. The chunk is already sitting on the 200 local register ceiling,
+-- so every helper lives on Hub.Replay instead of a file-level local.
+--
+-- Why this exists: the old code fired Event.ReplayCore exactly once, on the
+-- first tick where the GameEnded screen was up. If the server was still closing
+-- the match, or Cycler had not connected its button yet, that single shot was
+-- lost and the hub never tried again - the run sat on the game over screen
+-- forever with the toggle visibly on. Now it clicks the real button and retries
+-- until the screen actually closes, from its own thread.
+Hub.Replay = Hub.Replay or {}
+do
+    local R = Hub.Replay
+    R.Log = {}
+    R.Thread = nil
+
+    function R.Write(line)
+        R.Log[#R.Log + 1] = string.format("%s %s", os.date("%H:%M:%S"), tostring(line))
+        while #R.Log > 40 do
+            table.remove(R.Log, 1)
+        end
+        if HasFilesystem and type(writefile) == "function" then
+            pcall(writefile, MacroFolder .. "/ReplayLog.txt", table.concat(R.Log, "\n"))
+        end
+    end
+
+    -- Cycler builds it as GameEnded.Frame.replay, right next to Frame.back.
+    function R.Button()
+        local gameEnded = GetGameEndedGui()
+        local frame = gameEnded and gameEnded:FindFirstChild("Frame")
+        return frame and frame:FindFirstChild("replay")
+    end
+
+    -- The text is "REPLAY - [used/max]" or "NEXT: <chapter> - [used/max]", and
+    -- it is the only place the client exposes how many replays are left.
+    function R.Counter()
+        local button = R.Button()
+        if not button then
+            return nil, nil
+        end
+        local used, total = tostring(button.Text or ""):match("%[(%d+)%s*/%s*(%d+)%]")
+        used, total = tonumber(used), tonumber(total)
+        if used and total then
+            return used, total
+        end
+        return nil, nil
+    end
+
+    -- Cycler wires replay.MouseButton1Click -> Event.ReplayCore:FireServer(), so
+    -- clicking is equivalent to the remote but also respects the client's one
+    -- second debounce. The remote is only a fallback.
+    function R.Trigger()
+        local button = R.Button()
+
+        -- "THE DARKNESS" and "Dawn in the doomed world" hide the button on
+        -- purpose (main.Parent.replay.Visible = not Chapter). Firing the remote
+        -- there does nothing, so say so instead of hammering the server.
+        if button and button.Visible == false then
+            return false, "replay hidden for this chapter"
+        end
+
+        local used, total = R.Counter()
+        if used and total and used >= total then
+            return false, string.format("replays exhausted (%d/%d)", used, total)
+        end
+
+        -- Cycler connects the button only while the game over screen is up
+        -- (it disconnects the moment "back" is pressed), so a zero count here
+        -- just means we are early - fall through to the remote instead of
+        -- pretending a firesignal did something.
+        local connectionCount = 0
+        if button and type(getconnections) == "function" then
+            local ok, connections = pcall(getconnections, button.MouseButton1Click)
+            if ok and type(connections) == "table" then
+                connectionCount = #connections
+                for _, connection in ipairs(connections) do
+                    local fired = pcall(function()
+                        if type(connection.Fire) == "function" then
+                            connection:Fire()
+                        elseif type(connection.Function) == "function" then
+                            connection.Function()
+                        else
+                            error("Connection cannot be invoked")
+                        end
+                    end)
+                    if fired then
+                        return true, "clicked"
+                    end
+                end
+            end
+        end
+
+        if connectionCount > 0 and button and type(firesignal) == "function" then
+            local ok = pcall(firesignal, button.MouseButton1Click)
+            if ok then
+                return true, "signalled"
+            end
+        end
+
+        if Remotes.Replay then
+            local ok = pcall(function() Remotes.Replay:FireServer() end)
+            if ok then
+                return true, "remote"
+            end
+            return false, "remote rejected"
+        end
+
+        return false, "no replay button and no remote"
+    end
+
+    function R.Arm()
+        if State.ReplayArmedJob == game.JobId then
+            return
+        end
+        State.ReplayArmedJob = game.JobId
+        State.ReplayAttempts = 0
+
+        if R.Thread then
+            pcall(task.cancel, R.Thread)
+            R.Thread = nil
+        end
+
+        R.Thread = task.spawn(function()
+            local started = os.clock()
+            while State.Running and IsGameEnded() and os.clock() - started < 40 do
+                State.ReplayAttempts = (State.ReplayAttempts or 0) + 1
+                local ok, message = R.Trigger()
+                R.Write(string.format("attempt %d -> %s (%s)", State.ReplayAttempts, tostring(ok), tostring(message)))
+                SetStatus("Replay", string.format("attempt %d: %s", State.ReplayAttempts, tostring(message)))
+
+                if not ok
+                    and (message == "replay hidden for this chapter"
+                        or (type(message) == "string" and message:find("exhausted", 1, true))) then
+                    break
+                end
+                -- A click that landed gets a longer gap so the server can react
+                -- before the next one; the client's own debounce is only 1s.
+                task.wait(ok and 2.5 or 1.3)
+            end
+
+            if not IsGameEnded() then
+                -- Clear the latch so the next match end re-arms even when the
+                -- replay lands on the same server (same JobId).
+                State.ReplayArmedJob = ""
+                R.Write("game over screen closed, replay went through")
+                SetStatus("Replay", "match restarted")
+            end
+            R.Thread = nil
+        end)
     end
 end
 
@@ -2519,6 +2672,11 @@ task.spawn(function()
     local restartAfterReplay = false
 
     while State.Running do
+        -- A single unguarded error used to kill this thread for the rest of the
+        -- session while State.Running stayed true, which looked exactly like
+        -- "the toggles are on but nothing happens". Now the tick can fail and
+        -- the loop keeps going.
+        local okTick, tickError = pcall(function()
         local now = os.clock()
         if now - lastRefresh >= 1 then
             lastRefresh = now
@@ -2706,11 +2864,11 @@ task.spawn(function()
             end
 
             local shouldReplay = State.AutoReplay and not State.PendingLobbyReturn
-            if shouldReplay and Remotes.Replay then
-                restartAfterReplay = not State.PendingLobbyReturn
-                    and State.PlaybackEnabled
-                    and #State.Actions > 0
-                pcall(function() Remotes.Replay:FireServer() end)
+            if shouldReplay then
+                restartAfterReplay = State.PlaybackEnabled and #State.Actions > 0
+                -- Not a single FireServer any more: this retries the real button
+                -- until the game over screen actually closes.
+                Hub.Replay.Arm()
             end
         elseif not ended then
             replayLatched = false
@@ -2726,7 +2884,32 @@ task.spawn(function()
             end
         end
 
+        end)
+
+        if not okTick then
+            State.LastLoopError = tostring(tickError)
+            if State.LastLoopError ~= State.ReportedLoopError then
+                State.ReportedLoopError = State.LastLoopError
+                Hub.Replay.Write("cycle loop error: " .. tostring(tickError))
+            end
+        end
+
         task.wait(0.1)
+    end
+end)
+
+-- Auto Replay watchdog. It deliberately does not share a thread with the cycle
+-- loop: if that loop ever dies, this still presses the button on the game over
+-- screen. Hub.Replay.Arm is idempotent per job, so both callers are safe.
+task.spawn(function()
+    while State.Running do
+        if State.AutoReplay
+            and not State.PendingLobbyReturn
+            and IsGameEnded()
+            and State.ReplayArmedJob ~= game.JobId then
+            pcall(Hub.Replay.Arm)
+        end
+        task.wait(0.3)
     end
 end)
 
@@ -24875,6 +25058,29 @@ end)
 CycleBox:AddToggle("Auto Replay", "Replays the last match automatically", State.AutoReplay, function(value)
     State.AutoReplay = value == true
     QueueSave()
+end)
+
+CycleBox:AddActionRow("Press Replay Now", "Clicks the game over replay button right now", StarHubUI.Icons.Refresh, function()
+    if not IsGameEnded() then
+        Notify("REPLAY", "The game over screen is not open yet")
+        return
+    end
+    State.ReplayArmedJob = ""
+    Hub.Replay.Arm()
+    Notify("REPLAY", "Pressing the replay button")
+end)
+
+CycleBox:AddActionRow("Replay Log", "Last attempts and their result", StarHubUI.Icons.Refresh, function()
+    local lines = Hub.Replay.Log
+    if #lines == 0 then
+        Notify("REPLAY LOG", "Nothing logged yet")
+        return
+    end
+    local tail = {}
+    for index = math.max(1, #lines - 4), #lines do
+        tail[#tail + 1] = lines[index]
+    end
+    Notify("REPLAY LOG", table.concat(tail, "\n"))
 end)
 
 CycleBox:AddToggle("Auto Ready Up", "Fires the ready remote whenever the lobby is idle", State.AutoReady, function(value)
