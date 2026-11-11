@@ -43,6 +43,13 @@ local Hub = {
         Esp = false,
         EspMaxDist = 180,
         EspKinds = true,
+        EspPickups = false,
+        Noclip = false,
+        Fullbright = false,
+        Fov = false,
+        FovValue = 70,
+        BossAlert = true,
+        SkipCinematic = false,
         Aim = false,
         AimSmooth = 10,
         AutoBuy = false,
@@ -61,6 +68,7 @@ local Hub = {
     },
     Connections = {},
     Highlights = {},
+    Pickups = {},
     LastFire = {},
 }
 
@@ -209,13 +217,12 @@ local function ensureEspGui()
 end
 
 local function clearEsp()
-    for model, objects in pairs(Hub.Highlights) do
+    for _, objects in pairs(Hub.Highlights) do
         for _, object in ipairs(objects) do
             pcall(function() object:Destroy() end)
         end
     end
     Hub.Highlights = {}
-    if espGui then espGui:ClearAllChildren() end
 end
 
 local function drawEsp()
@@ -520,6 +527,212 @@ Hub.Track(LocalPlayer.CharacterAdded:Connect(function()
     stopFly()
 end))
 
+-- ============================================================ мир и удобства
+
+local noclipSaved = {}
+local noclipCharacter
+
+local function noclipStep()
+    local character = LocalPlayer.Character
+    if not character then return end
+
+    if noclipCharacter ~= character then
+        noclipCharacter = character
+        noclipSaved = {}
+    end
+
+    if Hub.State.Noclip then
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                noclipSaved[part] = true
+                pcall(function() part.CanCollide = false end)
+            end
+        end
+        return
+    end
+
+    for part in pairs(noclipSaved) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = true end)
+        end
+        noclipSaved[part] = nil
+    end
+end
+
+local lightingSaved
+local function fullbrightStep()
+    local lighting = game:GetService("Lighting")
+    if Hub.State.Fullbright then
+        if not lightingSaved then
+            lightingSaved = {
+                Brightness = lighting.Brightness,
+                Ambient = lighting.Ambient,
+                OutdoorAmbient = lighting.OutdoorAmbient,
+                FogEnd = lighting.FogEnd,
+                ClockTime = lighting.ClockTime,
+            }
+        end
+        lighting.Brightness = 3
+        lighting.Ambient = Color3.fromRGB(178, 178, 178)
+        lighting.OutdoorAmbient = Color3.fromRGB(178, 178, 178)
+        lighting.FogEnd = 100000
+        lighting.ClockTime = 14
+    elseif lightingSaved then
+        for key, value in pairs(lightingSaved) do
+            pcall(function() lighting[key] = value end)
+        end
+        lightingSaved = nil
+    end
+end
+
+local function fovStep()
+    local camera = Workspace.CurrentCamera
+    if not camera then return end
+    if Hub.State.Fov and camera.FieldOfView ~= Hub.State.FovValue then
+        camera.FieldOfView = Hub.State.FovValue
+    end
+end
+
+local PICKUP_FOLDERS = { "ASOrbs", "ASPickups", "ASGears" }
+
+local function collectPickups()
+    local list = {}
+    for _, folderName in ipairs(PICKUP_FOLDERS) do
+        local folder = Workspace:FindFirstChild(folderName)
+        if folder then
+            for _, child in ipairs(folder:GetChildren()) do
+                local part
+                if child:IsA("BasePart") then
+                    part = child
+                elseif child:IsA("Model") then
+                    part = child.PrimaryPart or child:FindFirstChildWhichIsA("BasePart")
+                end
+                if part then
+                    table.insert(list, { object = child, part = part, position = part.Position, kind = child.Name })
+                end
+            end
+        end
+    end
+    return list
+end
+
+local function clearPickups()
+    for _, items in pairs(Hub.Pickups) do
+        for _, item in ipairs(items) do pcall(function() item:Destroy() end) end
+    end
+    Hub.Pickups = {}
+end
+
+local function drawPickupEsp()
+    if not Hub.State.EspPickups then
+        if next(Hub.Pickups) then clearPickups() end
+        return
+    end
+
+    local gui = ensureEspGui()
+    local seen = {}
+    for _, pickup in ipairs(collectPickups()) do
+        seen[pickup.object] = true
+        if not Hub.Pickups[pickup.object] then
+            local highlight = Instance.new("Highlight")
+            highlight.Name = "ASHubPickup"
+            highlight.Adornee = pickup.object
+            highlight.FillColor = Color3.fromRGB(120, 255, 170)
+            highlight.FillTransparency = 0.5
+            highlight.OutlineColor = Color3.fromRGB(120, 255, 170)
+            highlight.OutlineTransparency = 0
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.Parent = gui
+
+            local billboard = Instance.new("BillboardGui")
+            billboard.Name = "ASHubPickupTag"
+            billboard.Adornee = pickup.part
+            billboard.Size = UDim2.fromOffset(110, 20)
+            billboard.StudsOffsetWorldSpace = Vector3.new(0, 1.4, 0)
+            billboard.AlwaysOnTop = true
+            billboard.Parent = gui
+
+            local label = Instance.new("TextLabel")
+            label.BackgroundTransparency = 1
+            label.Size = UDim2.fromScale(1, 1)
+            label.Font = Enum.Font.GothamBold
+            label.TextScaled = true
+            label.TextColor3 = Color3.fromRGB(150, 255, 190)
+            label.TextStrokeTransparency = 0.4
+            label.Text = pickup.kind
+            label.Parent = billboard
+
+            Hub.Pickups[pickup.object] = { highlight, billboard }
+        end
+    end
+
+    for object, items in pairs(Hub.Pickups) do
+        if not seen[object] then
+            for _, item in ipairs(items) do pcall(function() item:Destroy() end) end
+            Hub.Pickups[object] = nil
+        end
+    end
+end
+
+-- оповещение о боссе
+local toastGui
+local function toast(text, color)
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+    if not toastGui or not toastGui.Parent then
+        toastGui = Instance.new("ScreenGui")
+        toastGui.Name = "ASHubToast"
+        toastGui.ResetOnSpawn = false
+        toastGui.IgnoreGuiInset = true
+        toastGui.DisplayOrder = 60
+        toastGui.Parent = playerGui
+    end
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 0, 44)
+    label.Position = UDim2.new(0, 0, 0, 92)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 24
+    label.TextColor3 = color or Color3.fromRGB(255, 90, 90)
+    label.TextStrokeTransparency = 0.3
+    label.Text = text
+    label.TextTransparency = 1
+    label.Parent = toastGui
+
+    TweenService:Create(label, TweenInfo.new(0.25), { TextTransparency = 0 }):Play()
+    task.delay(2.2, function()
+        pcall(function()
+            TweenService:Create(label, TweenInfo.new(0.6), { TextTransparency = 1 }):Play()
+        end)
+    end)
+    task.delay(3.0, function()
+        pcall(function() label:Destroy() end)
+    end)
+end
+
+local lastSeenWave = -1
+local function bossAlertStep()
+    local wave = attr("ASWave", nil)
+    if type(wave) ~= "number" then return end
+    if wave == lastSeenWave then return end
+    lastSeenWave = wave
+    if not (Config and Config.nextBossWave) then return end
+
+    local ok, nextWave = pcall(Config.nextBossWave, wave)
+    if not (ok and nextWave == wave) then return end
+
+    if Hub.State.BossAlert then
+        local boss = "БОСС"
+        local bossName = AS and AS:GetAttribute("BossName")
+        if type(bossName) == "string" and bossName ~= "" then boss = bossName end
+        toast("ВОЛНА " .. tostring(wave) .. " — " .. boss)
+    end
+    if Hub.State.SkipCinematic then
+        Hub.Fire("SkipCinematic", 3)
+    end
+end
+
 -- ============================================================ интерфейс
 
 local function new(class, props, parent)
@@ -753,6 +966,14 @@ section("Визуал")
 toggle("ESP зомби", "Esp")
 toggle("Показывать вид зомби", "EspKinds")
 slider("Дистанция ESP", "EspMaxDist", 40, 400)
+toggle("ESP пикапов и орбов", "EspPickups")
+toggle("Полная яркость", "Fullbright")
+toggle("Свой FOV", "Fov")
+slider("FOV", "FovValue", 50, 120)
+toggle("Оповещение о боссе", "BossAlert")
+
+section("Мир")
+toggle("Noclip (проход сквозь стены)", "Noclip")
 
 section("Бой")
 toggle("Авто-наведение камеры", "Aim")
@@ -764,6 +985,7 @@ toggle("Авто-апгрейд оружия (тратит шары)", "AutoUpgr
 toggle("Авто-скип волн", "AutoSkip")
 toggle("Авто-награды", "AutoReward")
 toggle("Авто-рестарт после смерти", "AutoRestart")
+toggle("Скип катсцен босса", "SkipCinematic")
 toggle("Анти-АФК", "AntiAfk")
 
 section("Игрок")
@@ -775,7 +997,10 @@ toggle("Полёт (WASD + Space/Ctrl)", "Fly")
 slider("Скорость полёта", "FlySpeed", 10, 300)
 
 section("Сервис")
-action("Сбросить ESP", clearEsp)
+action("Сбросить ESP", function()
+    clearEsp()
+    clearPickups()
+end)
 action("Перезагрузить скрипт", function()
     if Hub.Unload then Hub.Unload() end
 end)
@@ -837,6 +1062,8 @@ Hub.Track(RunService.Heartbeat:Connect(function(dt)
         espAccumulator = 0
         local ok, err = pcall(drawEsp)
         if not ok then log("esp:", err) end
+        local pickOk, pickErr = pcall(drawPickupEsp)
+        if not pickOk then log("pickups:", pickErr) end
     end
 end))
 
@@ -848,6 +1075,10 @@ task.spawn(function()
         pcall(autoRewardStep)
         pcall(autoRestartStep)
         pcall(movementStep)
+        pcall(noclipStep)
+        pcall(fullbrightStep)
+        pcall(fovStep)
+        pcall(bossAlertStep)
         task.wait(0.35)
     end
 end)
@@ -901,6 +1132,11 @@ function Hub.Unload()
     end
     Hub.Connections = {}
     clearEsp()
+    clearPickups()
+    Hub.State.Fullbright = false
+    pcall(fullbrightStep)
+    if espGui then pcall(function() espGui:Destroy() end) end
+    if toastGui then pcall(function() toastGui:Destroy() end) end
     pcall(stopFly)
     pcall(function() RunService:UnbindFromRenderStep("ASHubAim") end)
     pcall(function() gui:Destroy() end)
