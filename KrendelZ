@@ -42,7 +42,7 @@ local State = {
     AutoReady = false,
     AutoSkip = false,
     AutoReplay = false,
-    AutoAbilities = true,
+    AutoAbilities = false,
     AutoSpeed = false,
     SpeedScaleDelay = 1,
     MovingAround = false,
@@ -895,6 +895,51 @@ local function ProfilePath(name)
     return MacroFolder .. "/" .. SanitizeName(name) .. ".json"
 end
 
+-- Older recordings wrote one action per attribute change, so a single Time Skip
+-- press turned into about ten entries: one on the caster plus one SkippedTimes
+-- on every tower that got skipped. Replaying those fired nine bogus calls for
+-- every real one. The recorder no longer writes them, and profiles are cleaned
+-- on load so an existing macro plays the way it was performed.
+local EchoAbilityMarkers = {
+    SkippedTimes = true,
+    Damage = true,
+    Abilities = true,
+    AutoAbilityAvailable = true,
+}
+
+local function SanitizeActions(actions)
+    local out = {}
+    local dropped = 0
+    local lastAt = -math.huge
+    local lastHandle = nil
+    for _, action in ipairs(actions) do
+        local skip = false
+        if action.Type == "Ability" then
+            local marker = tostring(action.Marker or "")
+            if EchoAbilityMarkers[marker] then
+                skip = true
+            else
+                -- Two casts in the same 50 ms on two different towers is the
+                -- echo pattern; a player cannot press two buttons that fast.
+                local at = tonumber(action.RecordedAt) or 0
+                if action.Handle ~= lastHandle and at - lastAt <= 0.05 then
+                    skip = true
+                end
+                if not skip then
+                    lastAt = at
+                    lastHandle = action.Handle
+                end
+            end
+        end
+        if skip then
+            dropped = dropped + 1
+        else
+            table.insert(out, action)
+        end
+    end
+    return out, dropped
+end
+
 local function SaveProfile(name)
     name = SanitizeName(name)
     if name == "" then
@@ -939,7 +984,13 @@ local function LoadProfile(name)
 
     State.ProfileName = name
     State.ProfileVersion = tonumber(decoded.Version) or 1
-    State.Actions = decoded.Actions
+    local cleaned, dropped = SanitizeActions(decoded.Actions)
+    State.Actions = cleaned
+    if dropped > 0 then
+        print(string.format(
+            "[SkibidiHub] profile %s: dropped %d echo action(s), %d left",
+            name, dropped, #cleaned))
+    end
     return true
 end
 
@@ -1130,77 +1181,8 @@ do
     end
 end
 
--- Auto Abilities. The game already ships this: Unit Manager's "Auto Ability"
--- button calls TowerScript.toggleAutoAbility:FireServer(towerName), the server
--- flips that tower's AutoAbility attribute, and the loop inside TowerScript then
--- casts every ready ability on its own for the rest of the match. The macro used
--- to replay recorded casts one by one instead, which is why abilities barely
--- fired - hundreds of one-shot casts, each waiting on a marker that never moves.
-Hub.AutoAbility = Hub.AutoAbility or {}
-do
-    local A = Hub.AutoAbility
-    A.Pending = {}
-    A.Count = 0
-    A.Thread = nil
-
-    function A.Enable()
-        local folder = TowerDataFolder
-        local toggle = Remotes.ToggleAuto
-        if not (folder and toggle) then
-            return 0
-        end
-        local now = os.clock()
-        local turned = 0
-        for _, tower in ipairs(folder:GetChildren()) do
-            local name = tostring(tower.Name)
-            local pendingAt = A.Pending[name]
-            -- The attribute comes back over the network, so a tower we just
-            -- toggled still reads false for a moment. The 4 s window keeps the
-            -- loop from toggling it back off again.
-            if (not pendingAt or now - pendingAt > 4)
-                and tower:GetAttribute("AutoAbilityAvailable") == true
-                and tower:GetAttribute("AutoAbility") ~= true then
-                A.Pending[name] = now
-                pcall(function()
-                    toggle:FireServer(name)
-                end)
-                turned = turned + 1
-            end
-        end
-        if turned > 0 then
-            A.Count = A.Count + turned
-            if HasFilesystem and type(writefile) == "function" then
-                local lines = {}
-                for _, tower in ipairs(folder:GetChildren()) do
-                    if tower:GetAttribute("AutoAbility") == true then
-                        lines[#lines + 1] = string.format("%s %s %s",
-                            os.date("%H:%M:%S"), tostring(tower.Name),
-                            tostring(tower:GetAttribute("ID")))
-                    end
-                end
-                pcall(writefile, MacroFolder .. "/AutoAbilityLog.txt",
-                    "turned on this tick: " .. tostring(turned) .. "\n"
-                    .. table.concat(lines, "\n"))
-            end
-        end
-        return turned
-    end
-
-    function A.Start()
-        if A.Thread then
-            return
-        end
-        A.Thread = task.spawn(function()
-            while State.Running do
-                if State.AutoAbilities and TowerDataFolder then
-                    pcall(A.Enable)
-                end
-                task.wait(1.5)
-            end
-            A.Thread = nil
-        end)
-    end
-end
+-- Auto Abilities was removed on request. The macro replays the casts that
+-- were recorded; it must not flip the game's own Auto Ability on by itself.
 
 local function RefreshActionList()
     if not Gui.ActionSummary then
@@ -1871,24 +1853,34 @@ local function AttachTowerRecorder(tower, handle)
         -- Two kinds of marker, measured live over 50s of idle combat.
         --
         -- Quiet ones only move when a cast actually goes off: ATTACK<Name>,
-        -- TimeSkipCount / SkippedTimes, the LOCK / SPAWNLOCK flags behind the
-        -- "Call In" abilities, the Abilities table and AutoAbilityAvailable.
-        -- Not one of them changed in 50s with nobody pressing anything.
+        -- TimeSkipCount, the LOCK / SPAWNLOCK flags behind the "Call In"
+        -- abilities and callingcarrier. Not one of them changed in 50s with
+        -- nobody pressing anything.
+        --
+        -- SkippedTimes, Damage, Abilities and AutoAbilityAvailable are echoes
+        -- of somebody else's cast and are ignored entirely below.
         --
         -- Noisy ones move during normal combat: StunMark moved 239 times and
         -- Stun 193 times in 40s because that is enemy CC landing ON the tower,
         -- and Damage drifts with every boost (7686 changes). Treating those as
         -- proof of a cast is what produced phantom ability actions, so they
         -- only count right after the player really clicked an ability button.
+        -- Echo attributes: they move as a *result* of a cast made on another
+        -- tower, never because this tower's own button was pressed. One Time
+        -- Skip press bumps SkippedTimes on every tower it skipped and drifts
+        -- Damage on the juggernauts, which used to be written down as ten
+        -- separate casts.
+        if name == "SkippedTimes" or name == "Damage"
+            or name == "Abilities" or name == "AutoAbilityAvailable" then
+            return
+        end
+
         local quiet = name:match("^ATTACK")
             or name:match("^TimeSkip")
-            or name == "SkippedTimes"
             or name:match("^LOCK")
             or name:match("^SPAWNLOCK")
             or name == "callingcarrier"
-            or name == "Abilities"
-            or name == "AutoAbilityAvailable"
-        local noisy = name:match("^Stun") or name == "Damage"
+        local noisy = name:match("^Stun")
         if not (quiet or noisy) then
             return
         end
@@ -2520,51 +2512,55 @@ local function PlayAbility(action)
     local abilityIndex = tonumber(action.AbilityIndex) or 1
     local previous = marker ~= "" and tower:GetAttribute(marker) or nil
 
-    -- Try the recorded slot first, then the remaining low slots. Some towers
-    -- expose a single ability and answer only to slot 1, and a rejected call
-    -- simply returns false, so walking the list is safe and cheap.
+    -- Faithful replay: only the recorded slot. Walking slots 2 and 3 whenever
+    -- the recorded one is busy casts a *different* ability, which is exactly how
+    -- a macro drifts away from what was recorded. A rejected call is normally a
+    -- cooldown that has not ticked over yet, so the same slot is retried a few
+    -- times and then written off - never swapped for another slot.
     local order = { abilityIndex }
-    for index = 1, 3 do
-        if index ~= abilityIndex then
-            table.insert(order, index)
-        end
+    if abilityIndex <= 0 then
+        order = { 1, 2, 3 }
     end
 
     local lastError = "Ability request failed"
     for _, slot in ipairs(order) do
-        if not State.Playing then
-            return false, "Playback stopped while casting"
-        end
-        local ok, accepted = pcall(
-            Remotes.Ability.InvokeServer,
-            Remotes.Ability,
-            tostring(tower.Name),
-            slot
-        )
-        if ok and accepted == true then
-            -- The cast landed, so this slot is right - never try the others.
-            -- "Abilities" is a one-shot flag the tower sets when it spawns and
-            -- never touches again, so waiting on it used to burn 1.2 s and then
-            -- re-cast slots 2 and 3 for nothing. Only counters are worth a
-            -- short confirmation wait.
-            local countable = marker ~= "" and (
-                marker:match("^ATTACK")
-                or marker:match("^LOCK")
-                or marker:match("^SPAWNLOCK")
-                or marker == "TimeSkipCount"
-                or marker == "SkippedTimes"
-            )
-            if not countable then
-                return true
+        for attempt = 1, 4 do
+            if not State.Playing then
+                return false, "Playback stopped while casting"
             end
-            WaitUntil(function()
-                return tower.Parent ~= TowerDataFolder or tower:GetAttribute(marker) ~= previous
-            end, 0.6, 0.03)
-            return true
-        elseif ok then
-            lastError = "Ability slot " .. tostring(slot) .. " was rejected"
-        else
-            lastError = "Ability request failed: " .. tostring(accepted)
+            local ok, accepted = pcall(
+                Remotes.Ability.InvokeServer,
+                Remotes.Ability,
+                tostring(tower.Name),
+                slot
+            )
+            if ok and accepted == true then
+                -- The cast landed. "Abilities" is a one-shot flag the tower
+                -- sets when it spawns and never touches again, so waiting on it
+                -- used to burn 1.2 s for nothing. Only counters are worth a
+                -- short confirmation wait.
+                local countable = marker ~= "" and (
+                    marker:match("^ATTACK")
+                    or marker:match("^LOCK")
+                    or marker:match("^SPAWNLOCK")
+                    or marker == "TimeSkipCount"
+                    or marker == "SkippedTimes"
+                )
+                if not countable then
+                    return true
+                end
+                WaitUntil(function()
+                    return tower.Parent ~= TowerDataFolder or tower:GetAttribute(marker) ~= previous
+                end, 0.6, 0.03)
+                return true
+            elseif ok then
+                lastError = "Ability slot " .. tostring(slot) .. " was rejected"
+            else
+                lastError = "Ability request failed: " .. tostring(accepted)
+            end
+            if attempt < 4 then
+                task.wait(0.15)
+            end
         end
     end
 
@@ -2725,15 +2721,10 @@ local function StartPlayback()
                     success, message = PlayTarget(action)
                 end
             elseif action.Type == "Ability" then
-                if State.AutoAbilities then
-                    -- The game's own Auto Ability loop casts everything that is
-                    -- ready, on the right slot, with real cooldowns. Replaying
-                    -- 2000 recorded casts on top of that only produced rejected
-                    -- calls, so the recorded ones step aside while it is on.
-                    success = true
-                else
-                    success, message = PlayAbility(action)
-                end
+                -- Always replay the recorded cast. A macro is a recording of
+                -- what the player pressed, not a "keep everything on cooldown"
+                -- instruction, so the hub must never substitute its own loop.
+                success, message = PlayAbility(action)
             elseif action.Type == "Speed" then
                 success, message = PlaySpeed(action)
             elseif action.Type == "BoostLink" then
@@ -24648,7 +24639,7 @@ end
 local CONFIG_AUTOLOAD = true
 local Config = CONFIG_AUTOLOAD and ReadConfig() or {}
 State.AutoReplay = Config.AutoReplay == true
-State.AutoAbilities = Config.AutoAbilities ~= false
+State.AutoAbilities = false
 State.AutoReady = Config.AutoReady == true
 State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
@@ -25702,16 +25693,8 @@ StatusBox:AddToggle("Record Speed / Pause", "Writes every x1-x6 press and every 
     QueueSave()
 end)
 
-StatusBox:AddToggle("Auto Abilities", "Switches the game's own Auto Ability on for every tower", State.AutoAbilities ~= false, function(value)
-    State.AutoAbilities = value == true
-    QueueSave()
-    if State.AutoAbilities then
-        Hub.AutoAbility.Start()
-        local turned = 0
-        pcall(function() turned = Hub.AutoAbility.Enable() end)
-        SetStatus("Auto Abilities", string.format("on, %d tower(s) switched", turned))
-    end
-end)
+-- Auto Abilities removed on request: the macro must replay the recorded casts
+-- exactly, not keep every ability on cooldown by itself.
 
 -- Misc ------------------------------------------------------------------------
 
@@ -29355,9 +29338,6 @@ do
         end
     end)
 end
-
--- Keeps every tower's built-in Auto Ability switched on for the whole match.
-Hub.AutoAbility.Start()
 
 print("Skibidi Defense Hub loaded. Made By KrendelZ :3 | Toggle key: " .. tostring(Window.Keybind and Window.Keybind.Name or "RightShift"))
 
