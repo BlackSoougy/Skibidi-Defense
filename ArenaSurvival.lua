@@ -56,6 +56,8 @@ local Hub = {
         WalkSpeed = 44,
         Jump = false,
         JumpPower = 50,
+        Fly = false,
+        FlySpeed = 60,
     },
     Connections = {},
     Highlights = {},
@@ -411,7 +413,89 @@ local function autoRestartStep()
     Hub.Fire("PlayAgain", 5)
 end
 
-local function movementStep()    local character = LocalPlayer.Character
+-- ============================================================ движение и полёт
+
+local flyState = { velocity = nil, gyro = nil, character = nil }
+
+local function stopFly()
+    if flyState.velocity then pcall(function() flyState.velocity:Destroy() end) end
+    if flyState.gyro then pcall(function() flyState.gyro:Destroy() end) end
+    flyState.velocity, flyState.gyro = nil, nil
+    local character = flyState.character or LocalPlayer.Character
+    flyState.character = nil
+    if character then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            pcall(function() humanoid.PlatformStand = false end)
+        end
+    end
+end
+
+local function startFly()
+    local character = LocalPlayer.Character
+    if not character then return false end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not (root and humanoid) then return false end
+
+    stopFly()
+    pcall(function() humanoid.PlatformStand = true end)
+
+    local velocity = Instance.new("BodyVelocity")
+    velocity.Name = "ASHubFly"
+    velocity.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+    velocity.Velocity = Vector3.zero
+    velocity.Parent = root
+
+    local gyro = Instance.new("BodyGyro")
+    gyro.Name = "ASHubFlyGyro"
+    gyro.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+    gyro.P = 3000
+    gyro.D = 50
+    gyro.CFrame = root.CFrame
+    gyro.Parent = root
+
+    flyState.velocity, flyState.gyro, flyState.character = velocity, gyro, character
+    return true
+end
+
+local function flyStep()
+    if not Hub.State.Fly then
+        if flyState.velocity then stopFly() end
+        return
+    end
+
+    local character = LocalPlayer.Character
+    if not character then return end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    if flyState.character ~= character or not flyState.velocity or not flyState.velocity.Parent then
+        if not startFly() then return end
+    end
+
+    local camera = Workspace.CurrentCamera
+    if not camera then return end
+
+    local look = camera.CFrame.LookVector
+    local right = camera.CFrame.RightVector
+    local direction = Vector3.zero
+
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then direction = direction + look end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then direction = direction - look end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then direction = direction + right end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then direction = direction - right end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then direction = direction + Vector3.new(0, 1, 0) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then direction = direction - Vector3.new(0, 1, 0) end
+
+    if direction.Magnitude > 0 then direction = direction.Unit end
+
+    flyState.velocity.Velocity = direction * Hub.State.FlySpeed
+    flyState.gyro.CFrame = camera.CFrame
+end
+
+local function movementStep()
+    local character = LocalPlayer.Character
     if not character then return end
     local humanoid = character:FindFirstChildOfClass("Humanoid")
     if not humanoid then return end
@@ -419,10 +503,22 @@ local function movementStep()    local character = LocalPlayer.Character
     if Hub.State.Speed and humanoid.WalkSpeed ~= Hub.State.WalkSpeed then
         humanoid.WalkSpeed = Hub.State.WalkSpeed
     end
-    if Hub.State.Jump and humanoid.JumpPower ~= Hub.State.JumpPower then
-        humanoid.JumpPower = Hub.State.JumpPower
+
+    if Hub.State.Jump then
+        -- игра держит UseJumpPower = false и рулит высотой через JumpHeight,
+        -- поэтому одной записи в JumpPower недостаточно
+        if humanoid.UseJumpPower ~= true then
+            pcall(function() humanoid.UseJumpPower = true end)
+        end
+        if humanoid.JumpPower ~= Hub.State.JumpPower then
+            humanoid.JumpPower = Hub.State.JumpPower
+        end
     end
 end
+
+Hub.Track(LocalPlayer.CharacterAdded:Connect(function()
+    stopFly()
+end))
 
 -- ============================================================ интерфейс
 
@@ -675,6 +771,8 @@ toggle("Скорость", "Speed")
 slider("WalkSpeed", "WalkSpeed", 16, 200)
 toggle("Прыжок", "Jump")
 slider("JumpPower", "JumpPower", 50, 250)
+toggle("Полёт (WASD + Space/Ctrl)", "Fly")
+slider("Скорость полёта", "FlySpeed", 10, 300)
 
 section("Сервис")
 action("Сбросить ESP", clearEsp)
@@ -728,6 +826,8 @@ end))
 Hub.Track(RunService.RenderStepped:Connect(function(dt)
     local ok, err = pcall(aimStep, dt)
     if not ok then log("aim:", err) end
+    local flyOk, flyErr = pcall(flyStep)
+    if not flyOk then log("fly:", flyErr) end
 end))
 
 local espAccumulator = 0
@@ -801,6 +901,7 @@ function Hub.Unload()
     end
     Hub.Connections = {}
     clearEsp()
+    pcall(stopFly)
     pcall(function() RunService:UnbindFromRenderStep("ASHubAim") end)
     pcall(function() gui:Destroy() end)
     if espGui then pcall(function() espGui:Destroy() end) end
