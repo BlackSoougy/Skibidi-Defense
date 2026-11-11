@@ -895,51 +895,6 @@ local function ProfilePath(name)
     return MacroFolder .. "/" .. SanitizeName(name) .. ".json"
 end
 
--- Older recordings wrote one action per attribute change, so a single Time Skip
--- press turned into about ten entries: one on the caster plus one SkippedTimes
--- on every tower that got skipped. Replaying those fired nine bogus calls for
--- every real one. The recorder no longer writes them, and profiles are cleaned
--- on load so an existing macro plays the way it was performed.
-local EchoAbilityMarkers = {
-    SkippedTimes = true,
-    Damage = true,
-    Abilities = true,
-    AutoAbilityAvailable = true,
-}
-
-local function SanitizeActions(actions)
-    local out = {}
-    local dropped = 0
-    local lastAt = -math.huge
-    local lastHandle = nil
-    for _, action in ipairs(actions) do
-        local skip = false
-        if action.Type == "Ability" then
-            local marker = tostring(action.Marker or "")
-            if EchoAbilityMarkers[marker] then
-                skip = true
-            else
-                -- Two casts in the same 50 ms on two different towers is the
-                -- echo pattern; a player cannot press two buttons that fast.
-                local at = tonumber(action.RecordedAt) or 0
-                if action.Handle ~= lastHandle and at - lastAt <= 0.05 then
-                    skip = true
-                end
-                if not skip then
-                    lastAt = at
-                    lastHandle = action.Handle
-                end
-            end
-        end
-        if skip then
-            dropped = dropped + 1
-        else
-            table.insert(out, action)
-        end
-    end
-    return out, dropped
-end
-
 local function SaveProfile(name)
     name = SanitizeName(name)
     if name == "" then
@@ -984,7 +939,46 @@ local function LoadProfile(name)
 
     State.ProfileName = name
     State.ProfileVersion = tonumber(decoded.Version) or 1
-    local cleaned, dropped = SanitizeActions(decoded.Actions)
+
+    -- Older recordings wrote one action per attribute change, so a single Time
+    -- Skip press turned into about ten entries: one on the caster plus one
+    -- SkippedTimes on every tower it skipped. Replaying those fired nine bogus
+    -- calls for every real one. Echo markers are dropped here, and two casts
+    -- landing in the same 50 ms on different towers collapse into one - a player
+    -- cannot press two buttons that fast.
+    local echo = {
+        SkippedTimes = true,
+        Damage = true,
+        Abilities = true,
+        AutoAbilityAvailable = true,
+    }
+    local cleaned = {}
+    local dropped = 0
+    local lastAt = -math.huge
+    local lastHandle = nil
+    for _, action in ipairs(decoded.Actions) do
+        local skip = false
+        if action.Type == "Ability" then
+            if echo[tostring(action.Marker or "")] then
+                skip = true
+            else
+                local at = tonumber(action.RecordedAt) or 0
+                if action.Handle ~= lastHandle and at - lastAt <= 0.05 then
+                    skip = true
+                end
+                if not skip then
+                    lastAt = at
+                    lastHandle = action.Handle
+                end
+            end
+        end
+        if skip then
+            dropped = dropped + 1
+        else
+            cleaned[#cleaned + 1] = action
+        end
+    end
+
     State.Actions = cleaned
     if dropped > 0 then
         print(string.format(
