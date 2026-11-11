@@ -158,7 +158,36 @@ local State = {
 }
 
 local MacroFolder = "SkibidiDefense_Macros"
-local ConfigFile = MacroFolder .. "/HubConfig.json"
+
+-- Конфиг привязан к аккаунту: у каждого свой файл, чтобы настройки одного
+-- аккаунта не переезжали на другой. Ключ — UserId (он не меняется при смене
+-- ника), фолбэк на имя, если UserId почему-то недоступен.
+local AccountKey = "unknown"
+do
+    local player = LocalPlayer
+    if not player then
+        local ok, value = pcall(function()
+            return Players.LocalPlayer
+        end)
+        if ok then player = value end
+    end
+    if player then
+        local id = tonumber(player.UserId)
+        if id and id > 0 then
+            AccountKey = "u" .. tostring(id)
+        else
+            local name = tostring(player.Name or "")
+            if name ~= "" then
+                AccountKey = "n" .. name:gsub("[^%w_%-]", "_")
+            end
+        end
+    end
+end
+
+local LegacyConfigFile = MacroFolder .. "/HubConfig.json"
+local ConfigFile = AccountKey ~= "unknown"
+    and (MacroFolder .. "/HubConfig_" .. AccountKey .. ".json")
+    or LegacyConfigFile
 local LegacyMacroFolder = "Kero" .. "TTD_Macros"
 local HasFilesystem = type(isfolder) == "function"
     and type(makefolder) == "function"
@@ -168,6 +197,20 @@ local HasFilesystem = type(isfolder) == "function"
 
 if HasFilesystem and not isfolder(MacroFolder) then
     makefolder(MacroFolder)
+end
+
+-- Первый запуск на этом аккаунте: берём старый общий конфиг как стартовую
+-- точку. Дальше аккаунт читает и пишет только свой файл, а общий
+-- HubConfig.json остаётся нетронутым на случай отката.
+local SeededFromLegacy = false
+if HasFilesystem
+    and ConfigFile ~= LegacyConfigFile
+    and not isfile(ConfigFile)
+    and isfile(LegacyConfigFile) then
+    local ok = pcall(function()
+        writefile(ConfigFile, readfile(LegacyConfigFile))
+    end)
+    SeededFromLegacy = ok
 end
 
 if HasFilesystem and type(listfiles) == "function" and isfolder(LegacyMacroFolder) then
@@ -908,7 +951,9 @@ local function ListProfiles()
     local result = {}
     for _, path in ipairs(listfiles(MacroFolder)) do
         local name = path:match("([^\\/]+)%.json$")
-        if name and name ~= "HubConfig" then
+        -- HubConfig.json и все аккаунтные HubConfig_*.json — это настройки,
+        -- а не записанные профили, поэтому в список профилей не попадают
+        if name and not name:match("^HubConfig") then
             table.insert(result, name)
         end
     end
@@ -24554,12 +24599,11 @@ local function ReadConfig()
     return ok and type(decoded) == "table" and decoded or {}
 end
 
--- ВРЕМЕННО: авто-загрузка конфига выключена.
--- Старый сохранённый конфиг мог держать FpsCap = 0 (setfpscap(0) в части
--- экзекуторов = 0 FPS, то есть полный залип клиента) или
--- PendingLobbyReturn = true (телепорт через секунду после старта).
--- Вернуть: поставить CONFIG_AUTOLOAD = true.
-local CONFIG_AUTOLOAD = false
+-- Автозагрузка включена: каждый аккаунт поднимает свой последний конфиг.
+-- Опасные значения из старых файлов гасятся ниже точечно, а не отключением
+-- загрузки целиком: FpsCap безопасен (setfpscap в этой сборке не вызывается),
+-- а PendingLobbyReturn принудительно сбрасывается в false.
+local CONFIG_AUTOLOAD = true
 local Config = CONFIG_AUTOLOAD and ReadConfig() or {}
 State.AutoReplay = Config.AutoReplay == true
 State.AutoAbilities = Config.AutoAbilities ~= false
@@ -24584,7 +24628,9 @@ State.AutoBackLobby = Config.AutoBackLobby == true
 State.MatchesBeforeLobby = math.max(1, math.floor(tonumber(Config.MatchesBeforeLobby) or 5))
 State.MatchesCompleted = math.max(0, math.floor(tonumber(Config.MatchesCompleted) or 0))
 State.LastCountedJobId = tostring(Config.LastCountedJobId or "")
-State.PendingLobbyReturn = Config.PendingLobbyReturn == true
+-- Всегда false, независимо от файла: иначе сохранённый конфиг телепортирует
+-- в лобби через секунду после запуска хаба.
+State.PendingLobbyReturn = false
 State.PumpkinOnCooldown = Config.PumpkinOnCooldown == true
 State.PumpkinTimer = Config.PumpkinTimer ~= false
 State.PumpkinMinutes = math.clamp(math.floor(tonumber(Config.PumpkinMinutes) or 10), 1, 30)
@@ -24722,6 +24768,7 @@ local function SaveConfig()
         SlenderRun = State.SlenderRun,
         SlenderPageDelay = State.SlenderPageDelay,
         SlenderCaveDelay = State.SlenderCaveDelay,
+        AccountId = AccountKey,
     }
     if Hub.Config and type(Hub.Config.Collect) == "function" then
         local collected, values = pcall(Hub.Config.Collect)
@@ -24743,6 +24790,16 @@ local function QueueSave()
     end)
 end
 Gui.QueueSave = QueueSave
+Gui.ConfigFile = ConfigFile
+Gui.AccountKey = AccountKey
+Gui.ConfigLoaded = CONFIG_AUTOLOAD
+
+-- одна строка в консоль: сразу видно, чей конфиг поднялся, и не надо гадать,
+-- почему настройка «не сохранилась» при переходе на другой аккаунт
+print(string.format("[SkibidiHub] account %s -> %s%s",
+    AccountKey,
+    ConfigFile,
+    SeededFromLegacy and "  (создан из общего HubConfig.json)" or ""))
 Gui.SaveConfigNow = SaveConfig
 
 if State.PendingLobbyReturn then
