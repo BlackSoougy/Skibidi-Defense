@@ -1084,6 +1084,7 @@ do
             return
         end
         State.ReplayArmedJob = game.JobId
+        State.ReplayArmedAt = os.clock()
         State.ReplayAttempts = 0
 
         if R.Thread then
@@ -1093,6 +1094,11 @@ do
 
         R.Thread = task.spawn(function()
             local started = os.clock()
+            -- pcall: раньше ошибка внутри Trigger убивала поток раньше, чем
+            -- сбрасывалась защёлка. JobId оставался висеть, и следующий конец
+            -- матча на том же сервере уже не вооружался - снаружи это ровно
+            -- "кнопка replay есть, а хаб её не нажимает".
+            pcall(function()
             while State.Running and IsGameEnded() and os.clock() - started < 40 do
                 State.ReplayAttempts = (State.ReplayAttempts or 0) + 1
                 local ok, message = R.Trigger()
@@ -1108,11 +1114,14 @@ do
                 -- before the next one; the client's own debounce is only 1s.
                 task.wait(ok and 2.5 or 1.3)
             end
+            end)
 
             if not IsGameEnded() then
                 -- Clear the latch so the next match end re-arms even when the
                 -- replay lands on the same server (same JobId).
                 State.ReplayArmedJob = ""
+                State.ReplayArmedAt = 0
+                State.ReplayRearms = 0
                 R.Write("game over screen closed, replay went through")
                 SetStatus("Replay", "match restarted")
             end
@@ -3039,6 +3048,39 @@ end)
 -- screen. Hub.Replay.Arm is idempotent per job, so both callers are safe.
 task.spawn(function()
     while State.Running do
+        -- Снимаем залипшую защёлку. Раньше её сбрасывал только сам поток
+        -- реплея, и если он умирал (ошибка в Trigger, reload хаба посреди
+        -- ожидания), JobId оставался в State навсегда: watchdog видел
+        -- "уже вооружено" и больше никогда не жал кнопку.
+        if State.ReplayArmedJob ~= "" and State.ReplayArmedJob ~= nil then
+            local thread = Hub.Replay and Hub.Replay.Thread
+            local alive = false
+            if thread then
+                if type(task.status) == "function" then
+                    local ok, status = pcall(task.status, thread)
+                    alive = ok and status ~= "dead"
+                else
+                    alive = true
+                end
+            end
+            local tooOld = (os.clock() - (State.ReplayArmedAt or 0)) > 120
+
+            if not IsGameEnded() then
+                -- экран закрылся: защёлка больше не нужна, счётчик попыток тоже
+                State.ReplayArmedJob = ""
+                State.ReplayArmedAt = 0
+                State.ReplayRearms = 0
+            elseif tooOld or not alive then
+                -- поток умер, а экран висит. Даём ещё пару заходов, но не
+                -- бесконечно: иначе это превращается в вечное дёрганье кнопки
+                if (State.ReplayRearms or 0) < 3 then
+                    State.ReplayRearms = (State.ReplayRearms or 0) + 1
+                    State.ReplayArmedJob = ""
+                    State.ReplayArmedAt = 0
+                end
+            end
+        end
+
         if State.AutoReplay
             and not State.PendingLobbyReturn
             and IsGameEnded()
